@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "ChromeOS Location Tracker",
+  "version": "1.0",
+  "description": "Enterprise extension to track managed ChromeOS device location.",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "enterprise.deviceAttributes",
+    "offscreen",
+    "alarms",
+    "geolocation"
+  ],
+  "host_permissions": [
+    "http://localhost:8080/*",
+    "https://*.yourdomain.com/*"
+  ]
+}

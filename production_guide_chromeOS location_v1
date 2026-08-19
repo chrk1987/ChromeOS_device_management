@@ -1,0 +1,67 @@
+# Location Tracker Extension — Complete Production Guide
+
+---
+
+## 1. Privacy Policy & Data Collection (Store Requirement)
+To publish to the Chrome Web Store, you **must** provide a Privacy Policy URL. In your privacy policy, you must clearly explain the data collected and its purpose to avoid suspension.
+
+**What to include in your Privacy Policy:**
+> **Data Collected:** The ChromeOS Location Tracker extension collects the device's geographic location (GPS coordinates) and the enterprise Directory Device ID.
+> **Purpose:** This data is collected solely for enterprise IT asset management and fleet tracking. The data is transmitted securely to the organization's internal IT portal to allow administrators to locate company-owned devices.
+> **Data Sharing:** This data is not shared with any third parties, sold, or used for advertising. It is strictly used for internal IT administrative purposes.
+
+---
+
+## 2. Chrome Web Store Assets (Logos & Screenshots)
+I have automatically generated the required placeholder icons (`icon16.png`, `icon48.png`, `icon128.png`) and saved them directly inside your `extension/` folder! You can use these right now for your submission.
+
+**Screenshots:** 
+For the Web Store screenshots (1280x800), you should take a screenshot of your portal's new **Location** tab showing the map and coordinates. Do not show the extension's code. Just show the business value (the map in your portal).
+
+---
+
+## 3. The New "Location" Tab
+I have moved the Live Tracking out of the "Usage & enrollment" tab. It now has its very own dedicated **Location** tab!
+- The map height has been expanded to perfectly align with the 4 detail cards on the right.
+- It looks exactly like a premium production dashboard.
+
+---
+
+## 4. How "Force Refresh" Works
+The extension on the Chromebook is asleep most of the time to save battery, waking up exactly every 15 minutes to ping. 
+The **"↻ Force Refresh"** button does **not** instantly wake up the Chromebook (since we can't push a signal to a sleeping extension). Instead, it polls your Go backend database every 2 seconds for up to 30 seconds to see if a *new* ping has arrived during that window. If the Chromebook happens to ping during those 30 seconds, the UI will instantly auto-update with a success message!
+
+---
+
+## 5. Resolving the manifest.json "Error"
+The JSON snippet you pasted:
+```json
+{
+  "manifest_version": 3,
+  "name": "ChromeOS Location Tracker",
+  "version": "1.0",
+  "description": "Enterprise extension to track managed ChromeOS device location.",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "enterprise.deviceAttributes",
+    "offscreen",
+    "alarms",
+    "geolocation"
+  ],
+  "host_permissions": [
+    "http://localhost:8080/*",
+    "https://*.yourdomain.com/*"
+  ]
+}
+```
+**This is completely valid.** If you are seeing a red syntax error in your code editor, it is simply because **you are missing the final closing brace `}`** at the very bottom of the file. Ensure the file ends with a `}` and the error will disappear!
+
+---
+
+## 6. Pre-Publishing Code Checklist
+Before zipping the `extension/` folder for the Web Store:
+1. Open `extension/manifest.json` and remove `"http://localhost:8080/*",` from `host_permissions` so it only has your production domain.
+2. Open `extension/background.js` and change `const API_URL = "http://localhost:8080/..."` to your production `https://...` URL.
+3. Open `extension/background.js` and change `let deviceId = "3421537a...";` back to `let deviceId = "unknown";` (the `enterprise.deviceAttributes` API handles the real ID automatically in production).

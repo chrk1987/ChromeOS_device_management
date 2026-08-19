@@ -1,0 +1,197 @@
+# Location Tracker Extension — Complete Production Guide
+
+---
+
+## Q1: Map UI Changes ✅ (Just implemented)
+
+The **Usage & enrollment** tab now shows:
+- **Two-column layout**: Interactive map on the left, info cards on the right.
+- **⤢ Full Map View** button — opens OpenStreetMap in a new tab.
+- **Google Maps** button — opens with pin.
+- **↻ Force Refresh** button — reloads the latest data from the backend.
+- **Coordinates** — displayed to 6 decimal places.
+- **±Accuracy** — rounded to the nearest meter.
+- **Last Ping** — formatted timestamp.
+- **Resolved Address** — auto reverse-geocoded using Nominatim (road, suburb, city, state, country).
+
+The **OS & updates** tab now shows:
+- **Device ID** — the full Google Directory ID (the one used by the extension).
+- **Serial number** — the device's serial number (previously shown as "Name").
+
+---
+
+## Q2: Production Changes Before Publishing to Chrome Web Store
+
+### Step 1: Replace localhost URL
+In `extension/background.js`, line 1:
+```js
+// BEFORE (testing only):
+const API_URL = "http://localhost:8080/api/chromeos/location";
+
+// AFTER (production):
+const API_URL = "https://your-portal-domain.com/api/chromeos/location";
+```
+
+### Step 2: Remove the hardcoded test Device ID
+In `extension/background.js`, line 21:
+```js
+// BEFORE (testing only):
+let deviceId = "3421537a-01b4-4013-9654-de1c6a2cf3b9";
+
+// AFTER (production - back to dynamic):
+let deviceId = "unknown";
+```
+On a real enrolled ChromeOS device, the `chrome.enterprise.deviceAttributes.getDirectoryDeviceId` API automatically returns the correct ID. No manual input needed.
+
+### Step 3: Add a real icon
+Chrome Web Store requires icons. Create and place these in your `extension/` folder:
+- `icon16.png` (16×16 px)
+- `icon48.png` (48×48 px)
+- `icon128.png` (128×128 px)
+
+Then add to `manifest.json`:
+```json
+"icons": {
+  "16": "icon16.png",
+  "48": "icon48.png",
+  "128": "icon128.png"
+}
+```
+
+### Step 4: Update `host_permissions` to production domain only
+```json
+"host_permissions": [
+  "https://your-portal-domain.com/*"
+]
+```
+
+### Step 5: Secure the `/api/chromeos/location` endpoint
+Currently the endpoint is **open** (no auth needed) so the extension can POST to it without a session cookie. For production, add a **secret API key** approach:
+
+In `extension/background.js`, add to the fetch headers:
+```js
+headers: {
+  "Content-Type": "application/json",
+  "X-Extension-Token": "your-secret-token-here"
+}
+```
+In the Go backend, validate this header in `handleLocationUpdate`.
+
+### Step 6: Final manifest.json for production
+```json
+{
+  "manifest_version": 3,
+  "name": "ChromeOS Location Tracker",
+  "version": "1.0.0",
+  "description": "Enterprise device location tracking for your IT admin portal.",
+  "background": { "service_worker": "background.js" },
+  "permissions": [
+    "enterprise.deviceAttributes",
+    "offscreen",
+    "alarms",
+    "geolocation"
+  ],
+  "host_permissions": [
+    "https://your-portal-domain.com/*"
+  ],
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}
+```
+
+---
+
+## Q3: Chrome Web Store Submission — Full Guide
+
+### Prerequisites
+- A **Google developer account** (one-time $5 USD registration fee)
+- Your extension as a `.zip` file of the `extension/` folder
+- 1-5 screenshots (1280×800 or 640×400 px)
+- A small promotional tile image (440×280 px)
+
+### Submission Checklist (Google's Requirements)
+
+| Requirement | Status | Notes |
+|---|---|---|
+| Manifest V3 | ✅ | Already using it |
+| No remote code execution | ✅ | All JS is in the package |
+| Minimal permissions | ✅ | Only what is needed |
+| `geolocation` justification | ✅ | Must explain in Store listing |
+| `enterprise.deviceAttributes` justification | ✅ | Must explain in listing |
+| Privacy Policy URL | ⬜ | **Required** for any extension requesting sensitive permissions |
+| Single purpose | ✅ | Only does location tracking |
+| No deceptive practices | ✅ | Installed by IT admin, not end users |
+
+### Step-by-Step Publishing Process
+
+1. Go to the [Chrome Developer Dashboard](https://chrome.google.com/webstore/devconsole)
+2. Click **Add new item**.
+3. Zip your extension: `Compress the extension/ folder` → `extension.zip`
+4. Upload `extension.zip`.
+5. Fill in the listing:
+   - **Name**: `ChromeOS Location Tracker`
+   - **Summary**: Enterprise IT location tracking for managed ChromeOS devices.
+   - **Description**: Explain clearly it is an enterprise extension for IT admins, installed via policy.
+   - **Category**: `Productivity`
+   - **Visibility**: Set to **Unlisted** (only your domain can install it via policy) — this is best practice for enterprise extensions.
+6. Under **Privacy**, add a hosted **Privacy Policy URL** explaining what location data is collected, who can see it, and how it's used.
+7. Under **Permissions Justification**, explain:
+   - `geolocation`: Required to read device GPS coordinates for enterprise IT fleet management.
+   - `enterprise.deviceAttributes`: Required to link location data to the correct managed device in the admin portal.
+8. Upload screenshots.
+9. Submit for review (usually 1-3 business days).
+
+### Google Policy Compliance — Critical Rules
+> [!CAUTION]
+> Violating these will get your extension **permanently suspended**.
+
+- ✅ **DO** state clearly in the description that this is an enterprise IT extension installed by an admin.
+- ✅ **DO** include a hosted Privacy Policy that explains data collection.
+- ✅ **DO** use **Unlisted** visibility so it isn't publicly searchable.
+- ❌ **DO NOT** collect data from users who have not consented — document the admin-consent flow.
+- ❌ **DO NOT** use any obfuscated code.
+- ❌ **DO NOT** use `eval()` or load remote scripts.
+
+---
+
+## Q4: Device ID in the Right Place ✅ (Just implemented)
+
+The Device ID is now shown properly in the **OS & updates** tab under a dedicated **"Device ID"** field, next to the **"Serial number"** field. It is no longer cluttering the main device list table.
+
+---
+
+## Q5: Automatic/Dynamic Device ID (Already Done!)
+
+The extension already handles this **automatically** on real enrolled ChromeOS devices.
+
+The code in `background.js`:
+```js
+if (chrome.enterprise && chrome.enterprise.deviceAttributes) {
+  deviceId = await new Promise((resolve) => {
+    chrome.enterprise.deviceAttributes.getDirectoryDeviceId(resolve);
+  });
+}
+```
+- On a **real managed ChromeOS device**: Google's `enterprise.deviceAttributes` API returns the exact Directory Device ID automatically. No manual entry ever needed.
+- On a **regular PC** (like your test): This API is not available, so it falls back to `"unknown"` (or your hardcoded test ID). This is **expected** and correct.
+
+**For production**: Simply revert the hardcoded ID back to `"unknown"` on line 21 of `background.js`. The API will take over automatically on enrolled ChromeOS devices.
+
+---
+
+## Q6: Prevent Users from Removing the Extension
+
+When you deploy the extension through the **Google Admin Console Policy** (which is exactly what your portal's "Deploy Location Tracker" button does via `FORCE_INSTALLED`), **users cannot remove it**. This is enforced at the OS policy level.
+
+Specifically:
+- The extension will have no **"Remove"** button on the `chrome://extensions/` page.
+- Even if a user tries via the command line or developer mode, it will be reinstalled at next policy sync.
+- It will automatically reinstall if the device is reset and re-enrolled.
+
+The policy you are already sending (`installationType: "FORCE_INSTALLED"`) is precisely the mechanism for this. No extra code is needed — it's built into ChromeOS enterprise policy enforcement.
+
+> [!IMPORTANT]
+> This enforcement **only works** on managed, enrolled ChromeOS devices in your Google Workspace domain. It does **not** apply to regular Windows/Mac PCs where you are currently testing.

@@ -1,0 +1,44 @@
+# Implementation Plan: Extension Flavours & JWT Authentication
+
+This plan outlines the architecture for managing environment-specific configurations (flavours) in the ChromeOS Location Extension and implementing secure JWT-based device authentication.
+
+## Proposed Changes
+
+### 1. Extension Build System & Flavours
+We will introduce a lightweight build step to inject the correct environment URL into the extension before packing it.
+
+#### [NEW] `extension/build.js`
+- A Node.js script that reads `flavours.json` and a target environment flag (e.g., `node build.js dev`).
+- It generates a `config.js` file containing the corresponding `API_URL`.
+
+#### [MODIFY] `extension/manifest.json`
+- Update the background service worker configuration to `"type": "module"` so it can import the dynamically generated `config.js`.
+
+#### [MODIFY] `extension/background.js`
+- Remove the hardcoded `API_URL` and import it from `config.js`.
+
+### 2. Backend JWT Authentication
+We will secure the location ping endpoint so that only valid, enrolled devices can report data.
+
+#### [MODIFY] `backend/go.mod`
+- Add `github.com/golang-jwt/jwt/v5` for secure token generation and validation.
+
+#### [MODIFY] `backend/main.go`
+- **New Endpoint (`POST /api/chromeos/auth/device`)**: Accepts a `deviceId`. Validates that the device exists in the active Google Workspace directory (`store.devices`). If valid, issues a signed JWT token valid for 24 hours.
+- **Secure Endpoint (`POST /api/chromeos/location`)**: Update to require an `Authorization: Bearer <token>` header. It will cryptographically verify the JWT, ensuring the location data is genuinely coming from the claimed device.
+
+### 3. Extension Authentication Flow
+
+#### [MODIFY] `extension/background.js`
+- Implement an in-memory token cache (`cachedToken`).
+- Before sending a location ping, check if a valid token exists. If not, call the new `/auth/device` endpoint to acquire one.
+- Attach the JWT to the `Authorization` header of the `/location` request.
+
+## Open Questions
+1. **JWT Secret Key**: For this prototype, I will use a hardcoded or randomly generated secret key in the backend memory. For production, this should be moved to an environment variable. Is this acceptable for now?
+2. **Build script execution**: Are you comfortable running `node build.js dev` inside the `extension` folder to generate the configuration before loading the unpacked extension into Chrome?
+
+## Verification Plan
+1. Run `node build.js qa` and verify the extension configures itself to the `qa` base URL.
+2. Run the backend and observe the extension requesting a JWT token on startup.
+3. Verify that manual curl requests to `/api/chromeos/location` without a valid JWT are rejected with `401 Unauthorized`.

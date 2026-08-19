@@ -1,0 +1,36 @@
+### Install the "REST Client" extension in VS Code, then click "Send Request"
+### above each block below. Run these top to bottom in order.
+
+@host = http://localhost:8080/api/chromeos
+
+### 0. Check current status (should be "disconnected" on a fresh run)
+GET {{host}}/status
+
+### 1. Generate credentials (fully automated step)
+POST {{host}}/connect/init
+
+### 2. Poll for admin authorization (mock auto-authorizes here)
+GET {{host}}/connect/status
+
+### 3. Finish - starts the background sync worker
+POST {{host}}/connect/finish
+
+### 4. Wait ~2 seconds after step 3, then check status (should be "active")
+GET {{host}}/status
+
+### 5. List synced devices
+GET {{host}}/devices
+
+### 6. Run a remote action - copy a real "id" from step 5's response first
+POST {{host}}/devices/action?id=REPLACE_WITH_DEVICE_ID
+Content-Type: application/json
+
+{
+  "action": "restart"
+}
+
+### 7. Check the action - copy the "id" from step 6's response
+GET {{host}}/actions?id=REPLACE_WITH_ACTION_ID
+
+### 8. Reset back to a clean disconnected state
+POST {{host}}/disconnect

@@ -1,0 +1,46 @@
+{
+    "local": {
+        "baseurl": "http://localhost:8080",
+        "useCollectorApi": false
+    },
+    "dev": {
+        "baseurl": "https://portal.dev.halofort.com",
+        "useCollectorApi": true,
+        "tenantId": "961023"
+    },
+    "qa": {
+        "baseurl": "https://portal.qa.halofort.com",
+        "useCollectorApi": true,
+        "tenantId": "961023"
+    },
+    "prod": {
+        "baseurl": "https://portal.halofort.com",
+        "useCollectorApi": true,
+        "tenantId": "961023"
+    },
+    "demo": {
+        "baseurl": "https://portal.emmdemo.tectoro.com",
+        "useCollectorApi": true,
+        "tenantId": "961023"
+    },
+    "uat": {
+        "baseurl": "https://portal.uat.halofort.com",
+        "useCollectorApi": true,
+        "tenantId": "961023"
+    },
+    "multiprod": {
+        "baseurl": "https://portal.mdm.tectoro.com",
+        "useCollectorApi": true,
+        "tenantId": "961023"
+    },
+    "ps1": {
+        "baseurl": "https://portal.ps1.halofort.com",
+        "useCollectorApi": true,
+        "tenantId": "961023"
+    },
+    "ps2": {
+        "baseurl": "https://portal.ps2.halofort.com",
+        "useCollectorApi": true,
+        "tenantId": "961023"
+    }
+}

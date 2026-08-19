@@ -1,0 +1,42 @@
+# Deploy Location Tracking Extension via Policy API
+
+The user has requested to automate the deployment of a location tracking Chrome extension directly from the custom portal, forcefully installing it on devices using the Chrome Policy API.
+
+## Proposed Changes
+
+We will add a new action button in the `DeviceActionsCard` in the frontend. When clicked, this will trigger the existing backend `/api/chromeos/policies/set` endpoint to push the `chrome.users.appsAndExtensions` policy to the device's Organizational Unit.
+
+### 1. Frontend Changes (`frontend/index.html`)
+
+#### [MODIFY] `frontend/index.html`
+- Add a new button under the **Device Actions** tab: **Deploy Location Tracker**.
+- Add a confirmation dialog explaining that this will push a Chrome Policy to the device's entire Organizational Unit (`device.orgUnit`) to force-install the tracking extension.
+- Wire the confirmation to send a `POST` request to `/api/chromeos/policies/set`.
+- The JSON payload will look like this:
+  ```json
+  {
+    "orgUnitPath": "/UAT Testing", // The device's OU
+    "schemaName": "chrome.users.appsAndExtensions",
+    "value": {
+      "appsAndExtensions": {
+        "YOUR_EXTENSION_ID_HERE": {
+          "installationType": "FORCE_INSTALLED",
+          "updateUrl": "https://clients2.google.com/service/update2/crx"
+        }
+      }
+    }
+  }
+  ```
+
+### 2. Backend Changes
+- **None Required!** The Go backend already fully supports passing any policy schema and value to the live Google Chrome Policy API via the `/api/chromeos/policies/set` endpoint (`handleSetPolicy`). We just need to make the frontend send the correct schema.
+
+## Open Questions
+> [!IMPORTANT]
+> To make this 100% real, we need your **Chrome Extension ID**. I will use a placeholder (e.g., `your_location_extension_id`) for now, which you can replace in the code with your actual Chrome Web Store extension ID once you have built it. Does this sound good?
+
+## Verification Plan
+1. Start the backend and frontend.
+2. Select a device in the portal.
+3. Click **Deploy Location Tracker** and confirm.
+4. Verify the network request sends the correct JSON payload to `/api/chromeos/policies/set`.
