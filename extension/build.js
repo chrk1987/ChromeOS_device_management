@@ -27,16 +27,18 @@ if (!config) {
 // Ensure the base URL doesn't have a trailing slash
 const baseUrl = config.baseurl.endsWith('/') ? config.baseurl.slice(0, -1) : config.baseurl;
 
-let apiUrl, authUrl;
+let apiUrl, authUrl, authLoginUrl;
 
 if (config.useCollectorApi) {
   // Production environments route to the new HaloFort collector endpoint and its custom auth endpoint
   apiUrl = `${baseUrl}/collector/v1/events/location_v1`;
-  authUrl = `${baseUrl}/chromeos/v1/{deviceId}?app={extensionId}`;
+  authUrl = `${baseUrl}/chromeos/v1/devicefeedback/{deviceId}?app=launcher`;
+  authLoginUrl = `${baseUrl}/idm/v1/auth/feedback/login`;
 } else {
   // Local development routes to the local Go backend (which doesn't require auth anymore)
   apiUrl = `${baseUrl}/api/chromeos/location`;
   authUrl = "";
+  authLoginUrl = "";
 }
 
 const configJsContent = `// AUTO-GENERATED FILE. DO NOT EDIT.
@@ -46,6 +48,7 @@ export const USE_COLLECTOR_API = ${!!config.useCollectorApi};
 export const TENANT_ID = "${config.tenantId || ''}";
 export const API_URL = "${apiUrl}";
 export const AUTH_URL = "${authUrl}";
+export const AUTH_LOGIN_URL = "${authLoginUrl}";
 `;
 
 fs.writeFileSync(path.join(__dirname, 'config.js'), configJsContent);

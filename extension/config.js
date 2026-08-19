@@ -4,4 +4,5 @@
 export const USE_COLLECTOR_API = true;
 export const TENANT_ID = "961023";
 export const API_URL = "https://portal.dev.halofort.com/collector/v1/events/location_v1";
-export const AUTH_URL = "https://portal.dev.halofort.com/chromeos/v1/{deviceId}?app={extensionId}";
+export const AUTH_URL = "https://portal.dev.halofort.com/chromeos/v1/devicefeedback/{deviceId}?app=launcher";
+export const AUTH_LOGIN_URL = "https://portal.dev.halofort.com/idm/v1/auth/feedback/login";

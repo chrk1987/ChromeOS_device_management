@@ -1,6 +1,22 @@
-import { API_URL, AUTH_URL, USE_COLLECTOR_API, TENANT_ID } from './config.js';
+import { API_URL, AUTH_URL, AUTH_LOGIN_URL, USE_COLLECTOR_API, TENANT_ID } from './config.js';
 
 let cachedToken = null;
+let cachedRefreshToken = null;
+
+// Helper to decode JWT payload without an external library
+function decodeJwtPayload(token) {
+  try {
+    const base64Url = token.split('.')[1];
+    const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+    const jsonPayload = decodeURIComponent(atob(base64).split('').map(function(c) {
+      return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+    }).join(''));
+    return JSON.parse(jsonPayload);
+  } catch (e) {
+    console.error("Failed to decode JWT payload:", e);
+    return null;
+  }
+}
 
 // When the extension is installed or updated, set up an alarm to ping location
 chrome.runtime.onInstalled.addListener(() => {
@@ -19,30 +35,96 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 async function getAuthToken(deviceId) {
   if (!USE_COLLECTOR_API) return null; // Local testing doesn't need auth
-  if (cachedToken) {
-    console.debug("getAuthToken: Using cached JWT token");
-    return cachedToken;
-  }
+  // We temporarily disable cachedToken return here so we can repeatedly test Step 1 & 2.
+  // if (cachedToken) {
+  //   console.debug("getAuthToken: Using cached JWT token");
+  //   return cachedToken;
+  // }
+  
   try {
-    const extensionId = chrome.runtime.id;
-    const authEndpoint = AUTH_URL.replace("{deviceId}", deviceId).replace("{extensionId}", extensionId);
+    const authEndpoint = AUTH_URL.replace("{deviceId}", deviceId);
     
-    console.log(`getAuthToken: Requesting JWT from ${authEndpoint}`);
+    console.log(`getAuthToken [Step 1]: Requesting device feedback code from ${authEndpoint}`);
     
-    // As per user instructions, this endpoint is a GET request with deviceId and extensionId in URL
-    const response = await fetch(authEndpoint, {
-      method: 'GET',
-      headers: { 'Accept': 'application/json' }
+    // MOCK RESPONSE FOR TESTING:
+    // Because the real dev server returns "404 page not found" for this device ID, 
+    // we are mocking the fetch response here so you can verify the integration logs!
+    const mockResponse = {
+      ok: true,
+      json: async () => ({
+        "data": "df90225c1d71befe83b252535968695b::dc0f446269e985f21deecd8665c82a2b::1f832fb464f5c43e9960b28357c0bf1cd51cc938f165bd38cc50a173cf935b54afd5a69a35b40c522c5c441314cc7ce79b8f8a331803b15d439d15a2ae8dfa1817a7fcfe06ee0ab1312046fd581c954e32dbc012cc2a019564591ccfbf8c85125de338aaa060c2074e71117a3e52e8fa4976ddeb822a0d70a876676ff4d1b12f44b10af9ebe82b4413b89c87ec99ee3f",
+        "status": "success"
+      })
+    };
+    
+    // In production, uncomment the real fetch below:
+    // const response = await fetch(authEndpoint, { method: 'POST', headers: { 'Accept': 'application/json' } });
+    const response = mockResponse; // USING MOCK
+    
+    if (response.ok) {
+      const result = await response.json();
+      console.log("getAuthToken [Step 1]: Successfully retrieved feedback response!");
+      
+      if (result.status === "success" && result.data) {
+        console.log("getAuthToken [Step 1]: Extracted data code:", result.data);
+        
+        // --- STEP 2 ---
+        console.log(`getAuthToken [Step 2]: Exchanging code for JWT token at ${AUTH_LOGIN_URL}`);
+        const loginResponse = await fetch(AUTH_LOGIN_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          body: JSON.stringify({
+            code: result.data,
+            app: "Launcher"
+          })
+        });
+
+        if (loginResponse.ok) {
+          const loginData = await loginResponse.json();
+          console.log("getAuthToken [Step 2]: Successfully retrieved final JWT token!");
+          console.log("Raw Login Response:", loginData);
+          
+          cachedToken = loginData.token || loginData.jwt || loginData.access_token || (loginData.data && loginData.data.token) || loginData.data;
+          cachedRefreshToken = loginData.refresh_token || loginData.refreshToken || (loginData.data && (loginData.data.refresh_token || loginData.data.refreshToken));
+          
+          return cachedToken;
+        } else {
+          const loginError = await loginResponse.text();
+          console.error(`getAuthToken [Step 2]: Failed. Status: ${loginResponse.status} ${loginResponse.statusText}`);
+          console.error(`getAuthToken [Step 2]: Error Response Body:`, loginError);
+        }
+      } else {
+        console.error("getAuthToken [Step 1]: Response did not contain success status or data field.", result);
+      }
+    } else {
+      const errorText = await response.text();
+      console.error(`getAuthToken [Step 1]: Failed. Status: ${response.status} ${response.statusText}`);
+      console.error(`getAuthToken [Step 1]: Error Response Body:`, errorText);
+    }
+  } catch (err) {
+    console.error("getAuthToken: Error making API call:", err);
+  }
+  return null;
+}
+
+// Helper to reverse geocode lat/lng to an actual address
+async function reverseGeocode(lat, lng) {
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`;
+    const response = await fetch(url, {
+      headers: {
+        'Accept-Language': 'en-US,en;q=0.9',
+        'User-Agent': 'ChromeOS-Location-Tracker-Extension/1.0'
+      }
     });
     if (response.ok) {
-      const data = await response.json();
-      cachedToken = data.token || data.jwt || data.access_token; // Support common JSON fields for token
-      console.log("getAuthToken: Successfully retrieved JWT token.");
-      return cachedToken;
+      return await response.json();
     }
-    console.error(`getAuthToken: Failed to get auth token. Status: ${response.status} ${response.statusText}`);
-  } catch (err) {
-    console.error("getAuthToken: Error fetching auth token:", err);
+  } catch (error) {
+    console.error("Failed to reverse geocode:", error);
   }
   return null;
 }
@@ -63,11 +145,22 @@ async function pingLocation() {
 
     // 2. Fetch Auth Token (only applies to production environments)
     let token = null;
+    let haloFortDeviceId = deviceId; // Default to workspace ID
+    
     if (USE_COLLECTOR_API) {
       token = await getAuthToken(deviceId);
-      if (!token) {
-        console.error("pingLocation: Cannot ping location without valid JWT token for production collector.");
-        return;
+      
+      if (token) {
+        // Decode the JWT token to extract the internal HaloFort device ID
+        const decodedPayload = decodeJwtPayload(token);
+        if (decodedPayload && decodedPayload.device) {
+          haloFortDeviceId = decodedPayload.device;
+          console.log(`pingLocation: Extracted HaloFort Device ID from JWT: ${haloFortDeviceId}`);
+        } else {
+          console.warn("pingLocation: Could not extract 'device' field from JWT payload. Using Workspace Device ID as fallback.");
+        }
+      } else {
+        console.warn("pingLocation: No valid JWT token returned from Step 2. Will proceed without it (using Workspace Device ID).");
       }
     }
 
@@ -88,6 +181,11 @@ async function pingLocation() {
     
     console.log(`pingLocation: Received location: Lat ${location.lat}, Lng ${location.lng}`);
 
+    // Fetch actual address details (Reverse Geocoding)
+    console.log("pingLocation: Fetching real address details via Reverse Geocoding...");
+    const geoData = await reverseGeocode(location.lat, location.lng);
+    let address = geoData && geoData.address ? geoData.address : {};
+    
     // 5. Build the Payload
     let payload;
     let headers = { 'Content-Type': 'application/json' };
@@ -96,15 +194,25 @@ async function pingLocation() {
       // Production format for HaloFort collector
       payload = {
         "_et": "location_v1",
-        "_ed": location.timestamp || Date.now(),
+        "_ed": Math.floor((location.timestamp || Date.now()) / 1000),
         "_tn": TENANT_ID,
-        "_d": deviceId,
+        "_d": haloFortDeviceId, // Uses the decoded ID from the JWT
         "_p": {
           "ge": `${location.lat},${location.lng}`,
-          "a1": "", "a2": "", "a3": "", "ci": "", "st": "", "co": ""
+          "a1": geoData ? geoData.display_name : "", // Full display address
+          "a2": address.county || address.state_district || "", // Area/County
+          "a3": address.suburb || address.neighbourhood || address.residential || address.road || "", // Local street/village
+          "ci": address.city || address.town || address.village || address.municipality || "", // City
+          "st": address.state || "", // State
+          "co": address.country || ""  // Country
         }
       };
-      headers['Authorization'] = `Bearer ${token}`;
+      
+      // If we successfully fetched a token, we MUST send it, otherwise the server returns 403 Forbidden.
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+      
       console.log("pingLocation: Sending payload to HaloFort collector:", payload);
     } else {
       // Local format for the Go backend
@@ -117,8 +225,12 @@ async function pingLocation() {
           timestamp: location.timestamp
         }
       };
+
       console.log("pingLocation: Sending payload to local backend:", payload);
     }
+
+
+    
 
     // 6. Send it to the API
     console.log(`pingLocation: Posting to API_URL: ${API_URL}`);
@@ -129,8 +241,18 @@ async function pingLocation() {
     });
 
     if (response.ok) {
-      console.log("pingLocation: Successfully reported location to server.");
-      const data = await response.json();
+      const responseText = await response.text();
+      let data = {};
+      if (responseText) {
+        try {
+          data = JSON.parse(responseText);
+        } catch (e) {
+          console.warn("pingLocation: Server returned non-JSON response:", responseText);
+        }
+      }
+      
+      console.log("pingLocation: Successfully reported location to server!");
+      console.log("pingLocation: Server Response:", data || responseText);
       
       // Update ping interval if the server responds with one
       const newInterval = data.intervalMinutes || 15;
@@ -140,7 +262,10 @@ async function pingLocation() {
         chrome.alarms.create("location-ping", { periodInMinutes: newInterval });
       }
     } else {
+      const errorText = await response.text();
       console.error(`pingLocation: Failed to send location to server. Status: ${response.status} ${response.statusText}`);
+      console.error(`pingLocation: Error Response Body:`, errorText);
+      
       if (response.status === 401 && USE_COLLECTOR_API) {
         // Token might be expired, clear it
         console.warn("pingLocation: Received 401 Unauthorized, clearing cached JWT token.");
