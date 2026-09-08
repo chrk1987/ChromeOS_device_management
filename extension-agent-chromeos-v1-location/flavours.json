@@ -1,0 +1,34 @@
+{
+    "dev": {
+        "baseurl": "https://portal.dev.halofort.com",
+        "useCollectorApi": true
+    },
+    "qa": {
+        "baseurl": "https://portal.qa.halofort.com",
+        "useCollectorApi": true
+    },
+    "prod": {
+        "baseurl": "https://portal.halofort.com",
+        "useCollectorApi": true
+    },
+    "demo": {
+        "baseurl": "https://portal.emmdemo.tectoro.com",
+        "useCollectorApi": true
+    },
+    "uat": {
+        "baseurl": "https://portal.uat.halofort.com",
+        "useCollectorApi": true
+    },
+    "multiprod": {
+        "baseurl": "https://portal.mdm.tectoro.com",
+        "useCollectorApi": true
+    },
+    "ps1": {
+        "baseurl": "https://portal.ps1.halofort.com",
+        "useCollectorApi": true
+    },
+    "ps2": {
+        "baseurl": "https://portal.ps2.halofort.com",
+        "useCollectorApi": true
+    }
+}

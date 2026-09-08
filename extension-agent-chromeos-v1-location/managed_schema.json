@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "properties": {
+    "useCollectorApi": {
+      "title": "Reporting mode",
+      "description": "Switches where this device's location is reported. ON (true) = HaloFort collector mode: goes through the device-feedback/JWT auth exchange and is sent to the HaloFort collector as a location_v1 event, tagged with tenant/device IDs - this is the production path. OFF (false) = Portal mode: posted directly to this connector's own backend at {baseUrl}/api/chromeos/location with no auth, so the location shows up in this project's own DeviceDashboard instead. Both modes use the same base URL below - only the path and whether auth is required differ.",
+      "type": "boolean"
+    },
+    "baseUrl": {
+      "title": "Backend base URL",
+      "description": "Base URL used for both reporting modes (e.g. https://portal.qa.halofort.com). Overrides the build-time default baked in at package time - leave unset to use that default. The exact path appended depends on Reporting mode above.",
+      "type": "string"
+    },
+    "tenantId": {
+      "title": "Tenant ID",
+      "description": "HaloFort tenant ID to report as a fallback when the feedback/login API's JWT doesn't itself carry a tenant claim. Only used in Collector reporting mode. Overrides the build-time default from flavours.json.",
+      "type": "string"
+    }
+  }
+}

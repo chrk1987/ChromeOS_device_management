@@ -1,0 +1,15 @@
+{
+  "name": "chromeos-location-extension",
+  "version": "1.0.0",
+  "description": "ChromeOS Location Tracker Extension build tools",
+  "scripts": {
+    "build:dev":       "node build.js dev",
+    "build:qa":        "node build.js qa",
+    "build:uat":       "node build.js uat",
+    "build:prod":      "node build.js prod",
+    "build:demo":      "node build.js demo",
+    "build:multiprod": "node build.js multiprod",
+    "build:ps1":       "node build.js ps1",
+    "build:ps2":       "node build.js ps2"
+  }
+}

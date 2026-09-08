@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // ---------- Domain types ----------
@@ -42,12 +45,20 @@ type Connection struct {
 }
 
 type Device struct {
-	ID                      string     `json:"id"`
-	Name                    string     `json:"name"`
-	User                    string     `json:"user"`
-	OrgUnit                 string     `json:"orgUnit"`
-	Status                  string     `json:"status"`                    // active | syncing | offline
-	Online                  bool       `json:"online"`                    // computed in handleDevices from LastSeen vs onlineAfterMinutes - a real-time-ish connectivity signal, separate from the longer-horizon Stale flag
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	User    string `json:"user"`
+	OrgUnit string `json:"orgUnit"`
+	Status  string `json:"status"` // active | syncing | offline
+	Online  bool   `json:"online"` // computed in handleDevices from LastSeen vs onlineAfterMinutes - a real-time-ish connectivity signal, separate from the longer-horizon Stale flag
+	// ExtensionOnline is a second, independent connectivity signal computed
+	// from the Location Tracker extension's own check-ins (TrackedLocationTime)
+	// against the same onlineAfterMinutes window - deliberately NOT blended
+	// into Online above, which stays a pure read of Google's Directory sync.
+	// Only meaningful once the extension has ever reported at least once;
+	// the frontend gates on TrackedLocationTime > 0 before showing it, so a
+	// device that never had the extension doesn't read as "extension offline".
+	ExtensionOnline         bool       `json:"extensionOnline,omitempty"`
 	ConnectionState         string     `json:"connectionState,omitempty"` // last-reported network state from Chrome Management Telemetry - a snapshot as of the device's last check-in, not a live ping (see decodeConnectionState)
 	ProvisionStatus         string     `json:"provisionStatus,omitempty"` // raw Google status: ACTIVE | DISABLED | DEPROVISIONED
 	LastSeen                time.Time  `json:"lastSeen"`
@@ -70,6 +81,8 @@ type Device struct {
 	RecentUserCount         int        `json:"recentUserCount,omitempty"`
 	CpuTempCelsius          int64      `json:"cpuTempCelsius,omitempty"`
 	TpmFamily               string     `json:"tpmFamily,omitempty"`
+	TpmFirmwareVersion      string     `json:"tpmFirmwareVersion,omitempty"`
+	PlatformVersion         string     `json:"platformVersion,omitempty"`
 	DeprovisionReason       string     `json:"deprovisionReason,omitempty"`
 	Location                string     `json:"location,omitempty"`
 	Notes                   string     `json:"notes,omitempty"`
@@ -94,13 +107,75 @@ type Device struct {
 	TrackedLocationTime         int64          `json:"trackedLocationTime,omitempty"`
 	TrackedLocationPingInterval int            `json:"trackedLocationPingInterval,omitempty"` // stored in minutes
 	LocationHistory             []LocationPing `json:"locationHistory,omitempty"`
+	// TrackedPublicIP is captured live from the location-ping HTTP request's
+	// own network source address (see realClientIP) - the device's actual
+	// public egress IP, independent of Google's Directory API lastKnownIp
+	// (which reports the device's private LAN address, not usable for IP
+	// geolocation). This is what makes IP-based location work for a device
+	// behind NAT: NAT hides the private IP from Google's inventory, but the
+	// router's own public IP is still visible to whatever server the
+	// device's own request actually reaches - us.
+	TrackedPublicIP string `json:"trackedPublicIp,omitempty"`
+
+	// WSConnected/WSLastEventTime back a genuinely real-time online/offline
+	// signal, separate from - and more accurate than - both Google's
+	// LastSync-based Online field and the ping-timestamp-based
+	// ExtensionOnline heuristic above. The extension holds this WebSocket
+	// open continuously (see handleDeviceWebSocket); WSConnected flips to
+	// true the instant the connection is accepted and false the instant the
+	// server detects it drop (closed cleanly, network lost, device slept/
+	// powered off) - no polling window, no "stale after N minutes" guess.
+	// WSLastEventTime is set on every state change (connect, disconnect, or
+	// heartbeat) so the frontend can show how long the current state has
+	// held, the same way the other two signals do.
+	WSConnected     bool  `json:"wsConnected,omitempty"`
+	WSLastEventTime int64 `json:"wsLastEventTime,omitempty"` // epoch ms, matches TrackedLocationTime's convention
+
+	// ConnectivityHistory is a real timeline of state transitions, not just
+	// the current snapshot the two fields above give - two independent
+	// sources feed it: the server appends its own ws_online/ws_offline
+	// entries the instant handleDeviceWebSocket's connection state changes
+	// (real, first-party knowledge, no extension involvement needed), while
+	// idle/active/locked entries come from the extension's own
+	// chrome.idle.onStateChanged listener explicitly reporting in via
+	// handleIdleState - that one genuinely can't be observed from the
+	// server side at all. Capped the same way LocationHistory is, oldest
+	// dropped first.
+	ConnectivityHistory []ConnectivityEvent `json:"connectivityHistory,omitempty"`
 }
+
+// ConnectivityEvent is one entry in ConnectivityHistory. Type is one of:
+// "ws_online", "ws_offline" (server-observed, real-time WebSocket state),
+// "idle_active", "idle_idle", "idle_locked" (extension-reported, from
+// chrome.idle - ChromeOS has no "asleep" state exposed to extensions at
+// all, so a full system suspend shows up only indirectly, as a gap between
+// entries with no idle_* event marking the transition itself).
+type ConnectivityEvent struct {
+	Timestamp int64  `json:"timestamp"` // epoch ms
+	Type      string `json:"type"`
+}
+
+const maxConnectivityHistory = 100
 
 type LocationPing struct {
 	Lat       float64 `json:"lat"`
 	Lng       float64 `json:"lng"`
 	Accuracy  float64 `json:"accuracy"`
 	Timestamp int64   `json:"timestamp"`
+}
+
+// IPLocation is a coarse, city-level location derived from a device's last-
+// known public IP - an independently-sourced fallback shown next to the
+// extension's on-device (Wi-Fi/GPS-assisted) location, not a replacement
+// for it. Accuracy is ISP/city-level at best, never street-level.
+type IPLocation struct {
+	IP      string  `json:"ip"`
+	City    string  `json:"city,omitempty"`
+	Region  string  `json:"region,omitempty"`
+	Country string  `json:"country,omitempty"`
+	Lat     float64 `json:"lat,omitempty"`
+	Lng     float64 `json:"lng,omitempty"`
+	ISP     string  `json:"isp,omitempty"`
 }
 
 // ChurnRecord is a deprovisioned/retired device - fetched via a separate
@@ -162,6 +237,13 @@ type DeviceEvent struct {
 	ReportTime  time.Time `json:"reportTime"`
 	UserEmail   string    `json:"userEmail,omitempty"`
 	Description string    `json:"description,omitempty"`
+	// AppId is Google's opaque app/extension identifier for APP_INSTALLED,
+	// APP_UNINSTALLED and APP_LAUNCHED events (empty for every other event
+	// type) - broken out from Description so the frontend can resolve it
+	// against the fleet-wide installed-apps catalog for a real display name
+	// instead of showing the raw ID, the same resolution each device's own
+	// Apps tab already does.
+	AppId string `json:"appId,omitempty"`
 }
 
 type MobileDeviceInfo struct {
@@ -205,10 +287,11 @@ type SecurityAlert struct {
 // (chrome.management.policy scope, read+write) - the actual enforced value,
 // not just whether a device reports compliance.
 type PolicyValue struct {
-	SchemaName  string `json:"schemaName"`
-	DisplayName string `json:"displayName"`
-	Category    string `json:"category,omitempty"`
-	Value       string `json:"value,omitempty"` // JSON-stringified resolved value; empty means not explicitly set (inherited default), not a fetch failure
+	SchemaName  string              `json:"schemaName"`
+	DisplayName string              `json:"displayName"`
+	Category    string              `json:"category,omitempty"`
+	Value       string              `json:"value,omitempty"` // JSON-stringified resolved value; empty means not explicitly set (inherited default), not a fetch failure
+	Fields      []PolicySchemaField `json:"fields,omitempty"` // schema field metadata, when known - lets the UI render a real form instead of a raw JSON box
 }
 
 // PolicySchemaField describes one settable field within a policy schema, as
@@ -217,9 +300,25 @@ type PolicyValue struct {
 // known values Google accepts, straight from the schema metadata rather
 // than guessed.
 type PolicySchemaField struct {
-	Name        string   `json:"name"`
-	Description string   `json:"description,omitempty"`
+	Name string `json:"name"`
+	Description string `json:"description,omitempty"`
 	KnownValues []string `json:"knownValues,omitempty"`
+	// DefaultValue is the schema's own documented client default (Google's
+	// FieldDescription.DefaultValue), used only to infer a field's real type
+	// (bool/string/number/array) when it has no current value to infer from
+	// (i.e. the policy was never explicitly set) - not shown as a value itself.
+	DefaultValue interface{} `json:"defaultValue,omitempty"`
+	// HasNestedFields mirrors whether Google's FieldDescription carried
+	// NestedFieldDescriptions - a real signal (not a guess) that this field is
+	// itself a message/object type, used to render a JSON box for it even
+	// when no current or default value exists to infer that shape from.
+	HasNestedFields bool `json:"hasNestedFields,omitempty"`
+	// IsRepeated mirrors the schema's own proto field label (LABEL_REPEATED)
+	// - a real signal that this field is an array, used to render a JSON box
+	// for a repeated-primitive field (e.g. a plain list of strings) even
+	// though it has no NestedFieldDescriptions and, when unset, no sample
+	// value to infer an array shape from either.
+	IsRepeated bool `json:"isRepeated,omitempty"`
 }
 
 // PolicySchemaInfo is one schema found via SearchPolicySchemas - the same
@@ -243,28 +342,116 @@ type PolicySchemaInfo struct {
 // boot performance, network diagnostics, battery), which the Directory
 // API's own DiskVolumeReports doesn't reliably populate.
 type DeviceTelemetry struct {
-	StorageAvailableBytes       int64         `json:"storageAvailableBytes,omitempty"`
-	StorageTotalBytes           int64         `json:"storageTotalBytes,omitempty"`
-	BootUpDurationSeconds       float64       `json:"bootUpDurationSeconds,omitempty"`
-	LastShutdownTime            *time.Time    `json:"lastShutdownTime,omitempty"`
-	LastShutdownDurationSeconds float64       `json:"lastShutdownDurationSeconds,omitempty"`
-	LastShutdownReason          string        `json:"lastShutdownReason,omitempty"`
-	ConnectionState             string        `json:"connectionState,omitempty"`
-	ConnectionType              string        `json:"connectionType,omitempty"`
-	LanIpAddress                string        `json:"lanIpAddress,omitempty"`
-	GatewayIpAddress            string        `json:"gatewayIpAddress,omitempty"`
-	LatencyMs                   float64       `json:"latencyMs,omitempty"`
-	LatencyProblem              string        `json:"latencyProblem,omitempty"`
-	BatteryHealth               string        `json:"batteryHealth,omitempty"`
-	BatteryCycleCount           int64         `json:"batteryCycleCount,omitempty"`
-	MemoryAvailableBytes        int64         `json:"memoryAvailableBytes,omitempty"`
-	MemoryTotalBytes            int64         `json:"memoryTotalBytes,omitempty"`
-	Displays                    []DisplayInfo `json:"displays,omitempty"`
-	AudioInputDevice            string        `json:"audioInputDevice,omitempty"`
-	AudioOutputDevice           string        `json:"audioOutputDevice,omitempty"`
-	AudioOutputVolume           int64         `json:"audioOutputVolume,omitempty"`
-	UsbPeripherals              []string      `json:"usbPeripherals,omitempty"`
-	AppsUsage                   []AppUsage    `json:"appsUsage,omitempty"`
+	StorageAvailableBytes int64 `json:"storageAvailableBytes,omitempty"`
+	StorageTotalBytes     int64 `json:"storageTotalBytes,omitempty"`
+	// Disk - StorageStatusReport.Disk (read_mask "storage_status_report") for
+	// model/serial/type, StorageInfo.Volume (already fetched via
+	// "storage_info") for the volume ID.
+	DiskModel                   string     `json:"diskModel,omitempty"`
+	DiskSerialNumber            string     `json:"diskSerialNumber,omitempty"`
+	DiskType                    string     `json:"diskType,omitempty"`
+	DiskVolumeId                string     `json:"diskVolumeId,omitempty"`
+	BootUpDurationSeconds       float64    `json:"bootUpDurationSeconds,omitempty"`
+	LastShutdownTime            *time.Time `json:"lastShutdownTime,omitempty"`
+	LastShutdownDurationSeconds float64    `json:"lastShutdownDurationSeconds,omitempty"`
+	LastShutdownReason          string     `json:"lastShutdownReason,omitempty"`
+	ConnectionState             string     `json:"connectionState,omitempty"`
+	ConnectionType              string     `json:"connectionType,omitempty"`
+	LanIpAddress                string     `json:"lanIpAddress,omitempty"`
+	GatewayIpAddress            string     `json:"gatewayIpAddress,omitempty"`
+	LatencyMs                   float64    `json:"latencyMs,omitempty"`
+	LatencyProblem              string     `json:"latencyProblem,omitempty"`
+	BatteryHealth               string     `json:"batteryHealth,omitempty"`
+	BatteryCycleCount           int64      `json:"batteryCycleCount,omitempty"`
+	MemoryAvailableBytes        int64      `json:"memoryAvailableBytes,omitempty"`
+	MemoryTotalBytes            int64      `json:"memoryTotalBytes,omitempty"`
+	MemoryPageFaults            int64      `json:"memoryPageFaults,omitempty"`
+	// TotalMemoryEncryptionInfo, part of MemoryInfo (already fetched via
+	// "memory_info").
+	MemoryEncryptionState     string        `json:"memoryEncryptionState,omitempty"`
+	MemoryEncryptionAlgorithm string        `json:"memoryEncryptionAlgorithm,omitempty"`
+	MemoryEncryptionKeyLength int64         `json:"memoryEncryptionKeyLength,omitempty"`
+	MemoryEncryptionMaxKeys   int64         `json:"memoryEncryptionMaxKeys,omitempty"`
+	Displays                  []DisplayInfo `json:"displays,omitempty"`
+	AudioInputDevice          string        `json:"audioInputDevice,omitempty"`
+	AudioOutputDevice         string        `json:"audioOutputDevice,omitempty"`
+	AudioOutputVolume         int64         `json:"audioOutputVolume,omitempty"`
+	UsbPeripherals            []string      `json:"usbPeripherals,omitempty"`
+	AppsUsage                 []AppUsage    `json:"appsUsage,omitempty"`
+
+	// CPU - CpuInfo (static specs, read_mask "cpu_info") + CpuStatusReport
+	// (periodic sample, read_mask "cpu_status_report"). Confirmed live via
+	// the Chrome Management API's own schema (chromemanagement/v1 discovery
+	// doc) - these are genuinely separate reports, not derived.
+	CpuModel               string        `json:"cpuModel,omitempty"`
+	CpuArchitecture        string        `json:"cpuArchitecture,omitempty"`
+	CpuMaxClockKhz         int64         `json:"cpuMaxClockKhz,omitempty"`
+	CpuKeylockerSupported  bool          `json:"cpuKeylockerSupported,omitempty"`
+	CpuKeylockerConfigured bool          `json:"cpuKeylockerConfigured,omitempty"`
+	CpuUtilizationPct      int64         `json:"cpuUtilizationPct,omitempty"`
+	CpuSampleFrequency     string        `json:"cpuSampleFrequency,omitempty"`
+	CpuTemperatures        []CpuCoreTemp `json:"cpuTemperatures,omitempty"`
+
+	// Battery - BatteryInfo (static specs, read_mask "battery_info") +
+	// BatteryStatusReport (periodic sample + its own nested sample array,
+	// read_mask "battery_status_report"). Confirmed live in the same schema.
+	BatteryManufacturer     string `json:"batteryManufacturer,omitempty"`
+	BatterySerialNumber     string `json:"batterySerialNumber,omitempty"`
+	BatteryTechnology       string `json:"batteryTechnology,omitempty"`
+	BatteryDesignMinVoltage int64  `json:"batteryDesignMinVoltageMv,omitempty"`
+	BatteryDesignCapacity   int64  `json:"batteryDesignCapacityMah,omitempty"`
+	BatteryManufactureDate  string `json:"batteryManufactureDate,omitempty"` // yyyy-mm-dd
+	BatteryFullChargeCap    int64  `json:"batteryFullChargeCapacityMah,omitempty"`
+	BatteryStatus           string `json:"batteryStatus,omitempty"` // e.g. Discharging
+	BatteryChargePct        int64  `json:"batteryChargePct,omitempty"`
+	BatteryDischargeRateMw  int64  `json:"batteryDischargeRateMw,omitempty"`
+	BatteryCurrentMa        int64  `json:"batteryCurrentMa,omitempty"`
+	BatteryVoltageMv        int64  `json:"batteryVoltageMv,omitempty"`
+	BatteryTempCelsius      int64  `json:"batteryTempCelsius,omitempty"`
+	// BatteryHealthPct is computed (fullChargeCapacity / designCapacity *
+	// 100) rather than read directly - Google's own BatteryHealth field
+	// (above) is only a 3-bucket enum (Normal/Replace soon/Replace now),
+	// while Admin console's Hardware tab shows a real percentage computed
+	// this same way (confirmed against that enum's own doc comment, which
+	// defines its buckets by this exact ratio). Only set when both real
+	// capacity numbers are available.
+	BatteryHealthPct int64 `json:"batteryHealthPct,omitempty"`
+
+	// Displays / touchscreens - GraphicsInfo.touchScreenInfo, read_mask
+	// "graphics_info" (already fetched for displayDevices above).
+	TouchscreenDevices []string `json:"touchscreenDevices,omitempty"`
+
+	// Audio - the mute/gain fields AudioStatusReport also carries, alongside
+	// the device names already mapped above.
+	AudioInputMute  bool  `json:"audioInputMute,omitempty"`
+	AudioOutputMute bool  `json:"audioOutputMute,omitempty"`
+	AudioInputGain  int64 `json:"audioInputGain,omitempty"`
+
+	// Network - extended NetworkStatusReport fields beyond the
+	// connection/IP basics already mapped above.
+	NetworkGuid            string `json:"networkGuid,omitempty"`
+	NetworkSignalStrength  int64  `json:"networkSignalStrengthDbm,omitempty"`
+	NetworkWifiLinkQuality int64  `json:"networkWifiLinkQuality,omitempty"`
+	NetworkTxBitrateMbps   int64  `json:"networkTxBitrateMbps,omitempty"`
+	NetworkRxBitrateMbps   int64  `json:"networkRxBitrateMbps,omitempty"`
+	NetworkTxPowerDbm      int64  `json:"networkTxPowerDbm,omitempty"`
+	NetworkEncryptionOn    bool   `json:"networkEncryptionOn,omitempty"`
+	NetworkWifiPowerMgmt   bool   `json:"networkWifiPowerMgmt,omitempty"`
+	// Note: Admin console's UI also shows "Metered", IPv6 addresses/gateway,
+	// "Link down speed", and a "WAN IP address" - confirmed against the
+	// pinned google.golang.org/api/chromemanagement/v1 client version this
+	// backend actually uses that NetworkStatusReport here doesn't carry
+	// those fields (an older SDK version than the very latest API surface).
+	// Not included here rather than guessed at; would need a dependency
+	// bump to `go.mod` to pick up the newer generated client if wanted.
+
+	// OS update - OsUpdateStatus, read_mask "os_update_status". State is
+	// already surfaced on the Device struct's OsUpdateState from the
+	// Directory API; these are the Telemetry API's own richer timestamps.
+	OsUpdateCheckTime *time.Time `json:"osUpdateCheckTime,omitempty"`
+	OsLastUpdateTime  *time.Time `json:"osLastUpdateTime,omitempty"`
+	OsLastRebootTime  *time.Time `json:"osLastRebootTime,omitempty"`
+
 	// Diagnostic only - how many separate AppReport snapshots Google
 	// actually returned for this device, and the oldest one's timestamp.
 	// Answers "is Admin console's fuller app list just a longer retention
@@ -289,6 +476,14 @@ type AppUsage struct {
 type DisplayInfo struct {
 	Name     string `json:"name,omitempty"`
 	Internal bool   `json:"internal,omitempty"`
+}
+
+// CpuCoreTemp is one entry from CpuStatusReport.CpuTemperatureInfo - one
+// reading per CPU core, each with its own label (e.g. "Core 0", "Package
+// id 0").
+type CpuCoreTemp struct {
+	Label              string `json:"label,omitempty"`
+	TemperatureCelsius int64  `json:"temperatureCelsius"`
 }
 
 // AdminRoleAssignment joins a Directory API role assignment to its role
@@ -409,12 +604,20 @@ type Store struct {
 	actions          map[string]*DeviceAction
 	actionSeq        int
 	google           GoogleClient // set in main() - mock or real, see google.go
-	syncIntervalMins int
+	syncIntervalSecs int
 	users            []*DirectoryUser // refreshed alongside devices in runSync
 	orgUnits         []*OrgUnitInfo   // refreshed alongside devices in runSync
 	churn            []*ChurnRecord   // refreshed alongside devices in runSync
 	groups           []*GroupInfo     // refreshed alongside devices in runSync
 	thresholds       Thresholds
+	// lastManualSyncAt is intentionally separate from conn.LastSync (which
+	// auto-sync also updates, on whatever interval Settings has it configured
+	// to, as low as 30s) - confirmed live as a real bug when this used
+	// conn.LastSync directly: with auto-sync running every 30s, it kept
+	// looking "recently synced" from auto-sync's own activity alone, so the
+	// manual cooldown below never actually cleared and the button stayed
+	// permanently disabled. Only handleSyncNow itself ever sets this.
+	lastManualSyncAt time.Time
 }
 
 func NewStore() *Store {
@@ -422,7 +625,7 @@ func NewStore() *Store {
 		conn:             Connection{Status: StatusDisconnected},
 		devices:          map[string]*Device{},
 		actions:          map[string]*DeviceAction{},
-		syncIntervalMins: 15,
+		syncIntervalSecs: 15 * 60,
 		thresholds:       defaultThresholds(),
 	}
 }
@@ -656,7 +859,18 @@ func runSync() {
 			d.TrackedLocationAccuracy = old.TrackedLocationAccuracy
 			d.TrackedLocationTime = old.TrackedLocationTime
 			d.TrackedLocationPingInterval = old.TrackedLocationPingInterval
+			d.TrackedPublicIP = old.TrackedPublicIP
 			d.LocationHistory = old.LocationHistory
+			// A live WebSocket connection's read/pong loop looks up
+			// store.devices[deviceID] fresh on every event (not a captured
+			// pointer), so it'll find and update this new *Device just
+			// fine going forward - but without carrying these two fields
+			// across, a sync landing mid-connection would show a real,
+			// currently-open connection as freshly "disconnected" until
+			// its next heartbeat corrected it, up to wsPingInterval later.
+			d.WSConnected = old.WSConnected
+			d.WSLastEventTime = old.WSLastEventTime
+			d.ConnectivityHistory = old.ConnectivityHistory
 		}
 		fresh[d.ID] = d
 	}
@@ -705,7 +919,7 @@ func runSync() {
 func autoSyncLoop() {
 	for {
 		store.mu.Lock()
-		mins := store.syncIntervalMins
+		secs := store.syncIntervalSecs
 		// Keep retrying through Error too - otherwise one transient failure
 		// (e.g. a DNS blip right after the machine wakes from sleep) leaves
 		// auto-sync permanently stuck until a manual disconnect/reconnect,
@@ -713,13 +927,32 @@ func autoSyncLoop() {
 		retryable := store.conn.Status == StatusActive || store.conn.Status == StatusError
 		store.mu.Unlock()
 
-		time.Sleep(time.Duration(mins) * time.Minute)
+		time.Sleep(time.Duration(secs) * time.Second)
 
 		if retryable {
 			runSync()
 		}
 	}
 }
+
+// minManualSyncCooldown guards the "Sync now" button against being mashed
+// repeatedly. Checked against Google's own current docs: the Directory API
+// (5 of the 6 calls a sync makes - ListDevices/Users/OrgUnits/Churn/Groups)
+// publishes a generous default of 2,400 queries/minute per user per GCP
+// project, comfortable even for large fleets at reasonable click rates. The
+// real risk is the 6th call: fetchSyncTelemetry runs once PER DEVICE, every
+// sync, against the Chrome Management API - which doesn't publish a fixed
+// public quota the way Directory does (it's managed per-project in Cloud
+// Console instead), so a burst of manual clicks on a large fleet could add
+// up before anyone has reason to think it's a problem. This errs
+// conservative rather than assuming no limit exists. Measured against
+// store.lastManualSyncAt specifically (set only by this handler) rather
+// than the shared conn.LastSync - auto-sync (Settings) updates that one too,
+// on its own interval (as low as 30s via the "Always" preset), which would
+// otherwise make this cooldown never clear at all whenever auto-sync is
+// running that fast - confirmed live as a real bug in an earlier version of
+// this guard.
+const minManualSyncCooldown = 30 * time.Second
 
 // POST /api/chromeos/sync
 // Triggers an immediate refresh from Google instead of waiting for the
@@ -731,11 +964,22 @@ func handleSyncNow(w http.ResponseWriter, r *http.Request) {
 	// from sleep) shouldn't require a full disconnect/reconnect to recover
 	// from. Only block retrying while genuinely mid-setup.
 	connected := store.conn.Status == StatusActive || store.conn.Status == StatusError
+	sinceLastManualSync := time.Since(store.lastManualSyncAt) // zero value -> a huge duration, i.e. never on cooldown
 	store.mu.Unlock()
 	if !connected {
 		http.Error(w, "not connected", http.StatusConflict)
 		return
 	}
+	if sinceLastManualSync < minManualSyncCooldown {
+		remaining := int((minManualSyncCooldown - sinceLastManualSync).Seconds()) + 1
+		w.Header().Set("Retry-After", strconv.Itoa(remaining))
+		http.Error(w, fmt.Sprintf("synced too recently - wait %ds before syncing again", remaining), http.StatusTooManyRequests)
+		return
+	}
+
+	store.mu.Lock()
+	store.lastManualSyncAt = time.Now()
+	store.mu.Unlock()
 
 	runSync()
 
@@ -744,27 +988,106 @@ func handleSyncNow(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, store.conn)
 }
 
+// POST /api/chromeos/devices/refresh?id=...
+// Refreshes ONE device via a live Chromeosdevices.Get instead of the
+// fleet-wide List handleSyncNow triggers - meant for the Devices table's
+// per-row "Refresh from Google" action, so checking on a single device
+// doesn't cost a full-fleet sync (and its associated per-device telemetry
+// calls) just to narrow that one row's staleness. This only shortens the
+// portal's OWN lag (the wait for the next scheduled sync to notice a
+// change) - Google's LastSync value itself only advances when the device's
+// own Chrome policy sync actually runs, which this can't force to happen
+// any sooner. Preserves the same extension-tracking fields runSync's merge
+// does, so a refresh here can't wipe out real location/IP data.
+func handleDeviceRefresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "id is required", http.StatusBadRequest)
+		return
+	}
+
+	store.mu.Lock()
+	connected := store.conn.Status == StatusActive || store.conn.Status == StatusError
+	google := store.google
+	old, existed := store.devices[id]
+	store.mu.Unlock()
+	if !connected {
+		http.Error(w, "not connected", http.StatusConflict)
+		return
+	}
+	if !existed {
+		http.Error(w, "device not found", http.StatusNotFound)
+		return
+	}
+
+	fresh, err := google.GetDevice(id)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("refreshing device: %v", err), http.StatusBadGateway)
+		return
+	}
+
+	store.mu.Lock()
+	// Same preservation runSync's merge does for a full sync - otherwise a
+	// single-device refresh would silently wipe out real extension-reported
+	// location/IP data that only lives in this portal's own store, not
+	// Google's.
+	fresh.TrackedLocationLat = old.TrackedLocationLat
+	fresh.TrackedLocationLng = old.TrackedLocationLng
+	fresh.TrackedLocationAccuracy = old.TrackedLocationAccuracy
+	fresh.TrackedLocationTime = old.TrackedLocationTime
+	fresh.TrackedLocationPingInterval = old.TrackedLocationPingInterval
+	fresh.TrackedPublicIP = old.TrackedPublicIP
+	fresh.LocationHistory = old.LocationHistory
+	fresh.WSConnected = old.WSConnected
+	fresh.WSLastEventTime = old.WSLastEventTime
+	fresh.ConnectivityHistory = old.ConnectivityHistory
+	staleAfter := time.Duration(store.thresholds.StaleAfterDays) * 24 * time.Hour
+	onlineAfter := time.Duration(store.thresholds.OnlineAfterMinutes) * time.Minute
+	now := time.Now()
+	fresh.Stale = fresh.Status == "active" && now.Sub(fresh.LastSeen) > staleAfter
+	fresh.Online = fresh.Status == "active" && now.Sub(fresh.LastSeen) <= onlineAfter
+	fresh.ExtensionOnline = extensionOnline(fresh, onlineAfter, now)
+	store.devices[id] = fresh
+	mongoStore.saveDevice(fresh)
+	store.mu.Unlock()
+
+	writeJSON(w, fresh)
+}
+
+// minSyncIntervalSecs floors how aggressively auto-sync can be configured -
+// below this, repeated ListDevices/ListUsers/ListOrgUnits/ListChurn/
+// ListGroups calls risk tripping Google's Directory API per-minute quota,
+// especially on larger fleets. The "Always" preset (~30s) sits comfortably
+// above this floor.
+const minSyncIntervalSecs = 10
+
 // GET/POST /api/chromeos/sync/settings
-// GET returns the current auto-sync interval; POST sets a new one
-// (accepts any positive number of minutes, including custom values).
+// GET returns the current auto-sync interval; POST sets a new one (accepts
+// any whole number of seconds at or above minSyncIntervalSecs, including
+// custom values - sub-minute intervals like the "Always" ~30s preset are
+// why this is seconds, not minutes).
 func handleSyncSettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPut || r.Method == http.MethodPost {
 		var body struct {
-			IntervalMinutes int `json:"intervalMinutes"`
+			IntervalSeconds int `json:"intervalSeconds"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.IntervalMinutes <= 0 {
-			http.Error(w, "intervalMinutes must be a positive integer", http.StatusBadRequest)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.IntervalSeconds < minSyncIntervalSecs {
+			http.Error(w, fmt.Sprintf("intervalSeconds must be at least %d", minSyncIntervalSecs), http.StatusBadRequest)
 			return
 		}
 		store.mu.Lock()
-		store.syncIntervalMins = body.IntervalMinutes
-		mongoStore.saveSettings(store.syncIntervalMins, store.thresholds)
+		store.syncIntervalSecs = body.IntervalSeconds
+		mongoStore.saveSettings(store.syncIntervalSecs, store.thresholds)
 		store.mu.Unlock()
 	}
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	writeJSON(w, map[string]int{"intervalMinutes": store.syncIntervalMins})
+	writeJSON(w, map[string]int{"intervalSeconds": store.syncIntervalSecs})
 }
 
 // GET/POST /api/chromeos/thresholds
@@ -807,7 +1130,7 @@ func handleThresholds(w http.ResponseWriter, r *http.Request) {
 
 		store.mu.Lock()
 		store.thresholds = body
-		mongoStore.saveSettings(store.syncIntervalMins, store.thresholds)
+		mongoStore.saveSettings(store.syncIntervalSecs, store.thresholds)
 		store.mu.Unlock()
 	}
 
@@ -961,6 +1284,35 @@ func handlePolicySearch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, results)
 }
 
+// GET /api/chromeos/policies/resolve?schema=<name>&displayName=<label>&category=<cat>
+// Resolves one caller-chosen schema (found via Browse policies) against the
+// root org unit - what lets the Policy compliance tile grid show a real
+// enforced value for a schema an admin "added" from search, not just its
+// static description.
+func handlePolicyResolve(w http.ResponseWriter, r *http.Request) {
+	schemaName := r.URL.Query().Get("schema")
+	if schemaName == "" {
+		http.Error(w, "schema is required", http.StatusBadRequest)
+		return
+	}
+	displayName := r.URL.Query().Get("displayName")
+	if displayName == "" {
+		displayName = schemaName
+	}
+	category := r.URL.Query().Get("category")
+
+	store.mu.Lock()
+	google := store.google
+	store.mu.Unlock()
+
+	result, err := google.ResolvePolicySchema(schemaName, displayName, category)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("resolving policy schema: %v", err), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, result)
+}
+
 // POST /api/chromeos/policies/set
 // body: {"orgUnitPath": "/Engineering", "schemaName": "chrome.devices.GuestMode", "value": {"guestModeEnabled": false}}
 // Requires chrome.management.policy - the write half of the scope handlePolicies
@@ -972,6 +1324,10 @@ func handleSetPolicy(w http.ResponseWriter, r *http.Request) {
 		OrgUnitPath string          `json:"orgUnitPath"`
 		SchemaName  string          `json:"schemaName"`
 		Value       json.RawMessage `json:"value"`
+		// AppID is optional - only needed for per-app-targeted schemas (e.g.
+		// chrome.users.apps.InstallType) where the Chrome Policy API expects
+		// the app in additionalTargetKeys.app_id rather than in the value.
+		AppID string `json:"appId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.OrgUnitPath == "" || body.SchemaName == "" || len(body.Value) == 0 {
 		http.Error(w, "orgUnitPath, schemaName, and value are required", http.StatusBadRequest)
@@ -982,7 +1338,7 @@ func handleSetPolicy(w http.ResponseWriter, r *http.Request) {
 	google := store.google
 	store.mu.Unlock()
 
-	if err := google.SetPolicy(body.OrgUnitPath, body.SchemaName, body.Value); err != nil {
+	if err := google.SetPolicy(body.OrgUnitPath, body.SchemaName, body.Value, body.AppID); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -1034,6 +1390,87 @@ func handleDeviceTelemetry(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, t)
 }
 
+// GET /api/chromeos/devices/ip-location?id=<deviceId>
+// Looks up an approximate, city-level location for the device's last-known
+// public IP via ip-api.com's free JSON endpoint - a second, independently
+// sourced location signal to show next to the extension's on-device
+// (Wi-Fi/GPS-assisted) location on the device's Location tab. This is
+// coarser (ISP/city-level, not street-level) since it has no access to the
+// device's actual Wi-Fi access-point scan data, only its public IP.
+// isPrivateOrLoopbackIP reports whether ip has no real-world location to
+// resolve - true for private/reserved ranges (192.168.x.x, 10.x.x.x,
+// 172.16-31.x.x), loopback (127.0.0.1, used when a device pings a
+// locally-hosted backend in dev/test), and link-local addresses. Used to
+// skip a candidate IP that can't be geolocated rather than send it to
+// ip-api.com and get back the same "private range" failure.
+func isPrivateOrLoopbackIP(ip string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return true // not a parseable IP at all - can't use it either way
+	}
+	return parsed.IsPrivate() || parsed.IsLoopback() || parsed.IsLinkLocalUnicast() || parsed.IsUnspecified()
+}
+
+func handleIPLocation(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	store.mu.Lock()
+	d, ok := store.devices[id]
+	store.mu.Unlock()
+	if !ok {
+		http.Error(w, "device not found", http.StatusNotFound)
+		return
+	}
+
+	// Prefer the IP captured live from the device's own location-ping
+	// request (its real public egress IP, works even though Google's own
+	// inventory only ever reports the private LAN address) - only fall
+	// back to Google's lastKnownIp if that's never been captured yet (the
+	// Location Tracker extension hasn't reported in this session/browser).
+	targetIP := d.TrackedPublicIP
+	if targetIP == "" || isPrivateOrLoopbackIP(targetIP) {
+		targetIP = d.LastKnownIP
+	}
+	if targetIP == "" {
+		http.Error(w, "device has no known IP address on record", http.StatusNotFound)
+		return
+	}
+	if isPrivateOrLoopbackIP(targetIP) {
+		http.Error(w, "IP location lookup failed: private range", http.StatusBadGateway)
+		return
+	}
+
+	resp, err := http.Get("http://ip-api.com/json/" + targetIP)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("looking up IP location: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	var raw struct {
+		Status  string  `json:"status"`
+		Message string  `json:"message"`
+		City    string  `json:"city"`
+		Region  string  `json:"regionName"`
+		Country string  `json:"country"`
+		Lat     float64 `json:"lat"`
+		Lon     float64 `json:"lon"`
+		ISP     string  `json:"isp"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		http.Error(w, fmt.Sprintf("decoding IP location response: %v", err), http.StatusBadGateway)
+		return
+	}
+	if raw.Status != "success" {
+		http.Error(w, fmt.Sprintf("IP location lookup failed: %s", raw.Message), http.StatusBadGateway)
+		return
+	}
+
+	writeJSON(w, IPLocation{
+		IP: targetIP, City: raw.City, Region: raw.Region, Country: raw.Country,
+		Lat: raw.Lat, Lng: raw.Lon, ISP: raw.ISP,
+	})
+}
+
 // GET /api/chromeos/admin-roles
 // Requires admin.directory.rolemanagement.readonly, a new scope - who holds
 // which Google Admin role (Super Admin, custom roles, etc), not this app's
@@ -1070,6 +1507,22 @@ func handleChromeReports(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, reports)
 }
 
+// extensionOnline reports whether the Location Tracker extension itself has
+// checked in recently, entirely separate from Google's Directory sync -
+// deliberately NOT blended into the main Online/Stale signals below, which
+// stay a pure read of what Google reports. Google's Directory sync interval
+// can be hours even while a device is actively connected, so mixing the two
+// made "Online" mean different things depending on whether a device
+// happened to have the extension installed - confusing, and not what
+// admins expect "Online" to reflect when it's sourced from Google. Instead
+// this is surfaced as its own separate signal on the device screen: has no
+// meaning (returns false) for a device that has never sent a ping at all,
+// which the frontend distinguishes by checking TrackedLocationTime > 0
+// before showing anything based on this.
+func extensionOnline(d *Device, onlineAfter time.Duration, now time.Time) bool {
+	return d.TrackedLocationTime > 0 && now.Sub(time.UnixMilli(d.TrackedLocationTime)) <= onlineAfter
+}
+
 // GET /api/chromeos/status
 func handleStatus(w http.ResponseWriter, r *http.Request) {
 	store.mu.Lock()
@@ -1101,8 +1554,15 @@ func handleDevices(w http.ResponseWriter, r *http.Request) {
 		// once the device reconnects, so it can still read "Online" hours
 		// after a device actually went dark.
 		d.Online = d.Status == "active" && now.Sub(d.LastSeen) <= onlineAfter
+		d.ExtensionOnline = extensionOnline(d, onlineAfter, now)
 		list = append(list, d)
 	}
+	// store.devices is a Go map - iteration order is deliberately randomized
+	// by the runtime, so without this the table's row order would visibly
+	// shuffle on every single fetch (initial load, tab switch, sync) even
+	// with zero data changes. Sorting by ID gives a stable order that only
+	// changes when the fleet itself changes (a device added/removed).
+	sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
 	writeJSON(w, list)
 }
 
@@ -1234,6 +1694,20 @@ type FleetInsights struct {
 	UpdateStatusCounts        map[string]int   `json:"updateStatusCounts"`
 	EnrollmentTrend           []MonthlyCount   `json:"enrollmentTrend"`
 	DirectoryHealth           DirectoryHealth  `json:"directoryHealth"`
+
+	// LiveExtension* is the fleet-wide rollup of the SAME real-time signal
+	// the Devices table's "Live check-in" column shows per-device (live
+	// WebSocket when the extension holds one open, falling back to its
+	// periodic-ping timestamp otherwise) - deliberately a separate donut
+	// from ActiveDevices/OfflineDevices above, which stay pure Google
+	// Directory sync. Extension-reporting devices are further split into
+	// Online/Offline; devices that have never sent any extension signal at
+	// all (no WS, no ping, ever) are counted separately rather than folded
+	// into "Offline," since "never installed/never connected" and
+	// "installed but currently down" are different, non-equivalent facts.
+	LiveExtensionOnline       int `json:"liveExtensionOnline"`
+	LiveExtensionOffline      int `json:"liveExtensionOffline"`
+	LiveExtensionNotReporting int `json:"liveExtensionNotReporting"`
 }
 
 // GET /api/chromeos/insights
@@ -1290,7 +1764,18 @@ func handleInsights(w http.ResponseWriter, r *http.Request) {
 	enrollmentMonthsChromeOs := map[string]int{}
 	enrollmentMonthsFlex := map[string]int{}
 
+	// store.devices is a Go map - iterating it directly would make every one
+	// of the warning/metric lists below (StorageWarnings, HotDevices, etc.)
+	// silently reorder on every fetch, same issue as handleDevices. Sorting
+	// once here means every list this loop appends into inherits a stable
+	// order for free, instead of needing an individual sort.Slice per field.
+	sortedDevices := make([]*Device, 0, len(store.devices))
 	for _, d := range store.devices {
+		sortedDevices = append(sortedDevices, d)
+	}
+	sort.Slice(sortedDevices, func(i, j int) bool { return sortedDevices[i].ID < sortedDevices[j].ID })
+
+	for _, d := range sortedDevices {
 		insights.TotalDevices++
 		stale := now.Sub(d.LastSeen) > staleAfter
 		if stale {
@@ -1308,6 +1793,20 @@ func handleInsights(w http.ResponseWriter, r *http.Request) {
 			insights.ActiveDevices++
 		} else {
 			insights.OfflineDevices++
+		}
+		switch {
+		case d.WSConnected:
+			insights.LiveExtensionOnline++
+		case d.WSLastEventTime > 0 || d.TrackedLocationTime > 0:
+			// Has reported at least once via one of the two extension
+			// signals, just not connected/recent right now.
+			if extensionOnline(d, onlineAfter, now) {
+				insights.LiveExtensionOnline++
+			} else {
+				insights.LiveExtensionOffline++
+			}
+		default:
+			insights.LiveExtensionNotReporting++
 		}
 		if d.OsVersion != "" {
 			insights.OsVersions[d.OsVersion]++
@@ -1713,11 +2212,62 @@ func handleDeviceAction(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, action)
 }
 
-// GET /api/chromeos/device-events?hours=24&types=NETWORK_STATE_CHANGE,USB_ADDED
+// POST /api/chromeos/devices/asset-info  { "deviceId": "...", "location": "...", "notes": "...", "orderNumber": "..." }
+// Writes the free-text "Asset info" fields (annotatedLocation/notes/
+// orderNumber) that were previously only readable here and only editable
+// from Admin console directly - the same fields the "Location (by
+// building)" fleet insight and each device's own Asset info block read.
+// Deliberately a plain synchronous request/response instead of the
+// DeviceAction queue handleDeviceAction uses: this isn't a state-changing
+// device action (nothing to poll, no async Google-side processing), just a
+// metadata write - operator role is enough since it can't disable/wipe/move
+// anything.
+func handleAssetInfoUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		DeviceID    string `json:"deviceId"`
+		Location    string `json:"location"`
+		Notes       string `json:"notes"`
+		OrderNumber string `json:"orderNumber"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.DeviceID == "" {
+		http.Error(w, "deviceId is required", http.StatusBadRequest)
+		return
+	}
+
+	store.mu.Lock()
+	dev, ok := store.devices[body.DeviceID]
+	store.mu.Unlock()
+	if !ok {
+		http.Error(w, "device not found", http.StatusNotFound)
+		return
+	}
+
+	if err := store.google.UpdateAssetInfo(body.DeviceID, body.Location, body.Notes, body.OrderNumber); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	store.mu.Lock()
+	dev.Location, dev.Notes, dev.OrderNumber = body.Location, body.Notes, body.OrderNumber
+	mongoStore.saveDevice(dev)
+	store.mu.Unlock()
+
+	writeJSON(w, dev)
+}
+
+// GET /api/chromeos/device-events?hours=24&types=NETWORK_STATE_CHANGE,USB_ADDED&deviceId=...
 // hours defaults to 24 if omitted/invalid; types defaults to
-// defaultTelemetryEventTypes (see google.go) if omitted. DeviceName is
-// resolved against the currently-synced device list so the frontend never
-// has to show a bare opaque device ID.
+// defaultTelemetryEventTypes (see google.go) if omitted; deviceId, when
+// present, narrows the feed to just that device (server-side, via the
+// API's own device_id filter) - used by the device detail page's Events
+// tab instead of the fleet-wide Activity view fetching and discarding
+// every other device's events. DeviceName is resolved against the
+// currently-synced device list so the frontend never has to show a bare
+// opaque device ID.
 func handleDeviceEvents(w http.ResponseWriter, r *http.Request) {
 	hours := 24
 	if h, err := strconv.Atoi(r.URL.Query().Get("hours")); err == nil && h > 0 {
@@ -1727,8 +2277,9 @@ func handleDeviceEvents(w http.ResponseWriter, r *http.Request) {
 	if t := r.URL.Query().Get("types"); t != "" {
 		types = strings.Split(t, ",")
 	}
+	deviceID := r.URL.Query().Get("deviceId")
 
-	events, err := store.google.ListDeviceEvents(types, time.Now().Add(-time.Duration(hours)*time.Hour))
+	events, err := store.google.ListDeviceEvents(types, time.Now().Add(-time.Duration(hours)*time.Hour), deviceID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -1810,9 +2361,38 @@ func handleDisconnect(w http.ResponseWriter, r *http.Request) {
 	defer store.mu.Unlock()
 	store.conn = Connection{Status: StatusDisconnected}
 	store.devices = map[string]*Device{}
+	// Confirmed live as a real bug otherwise: leaving the previous
+	// store.google in place meant the OLD, already-authorized Google client
+	// stayed fully live in memory - the Setup Wizard's own polling
+	// (handleConnectStatus -> Probe()) would then succeed immediately using
+	// those stale credentials, silently "reconnecting" without the admin
+	// ever uploading a new service account key. A genuine disconnect must
+	// also drop the live client, not just the UI-facing status/device cache.
+	store.google = disconnectedGoogleClient{}
 	mongoStore.saveConnection(store.conn)
 	mongoStore.saveDevices(store.devices)
 	writeJSON(w, store.conn)
+}
+
+// realClientIP returns the request's actual network source IP - the
+// device's real public egress IP, as seen by this server, regardless of
+// what private LAN address Google's own inventory reports for it.
+// X-Forwarded-For is honored (first hop - the original client) for a
+// deployment sitting behind a reverse proxy/load balancer, which would
+// otherwise make every request's RemoteAddr the proxy's own IP instead of
+// the real caller's. Falls back to RemoteAddr directly when there's no
+// proxy in front (e.g. this prototype's default setup).
+func realClientIP(r *http.Request) string {
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		if ip := strings.TrimSpace(strings.Split(fwd, ",")[0]); ip != "" {
+			return ip
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr // RemoteAddr had no port (unusual, but don't drop it)
+	}
+	return host
 }
 
 func handleLocationUpdate(w http.ResponseWriter, r *http.Request) {
@@ -1835,6 +2415,7 @@ func handleLocationUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var interval int = 15 // Default 15 minutes
+	clientIP := realClientIP(r)
 
 	store.mu.Lock()
 	if dev, ok := store.devices[body.DeviceID]; ok {
@@ -1842,6 +2423,7 @@ func handleLocationUpdate(w http.ResponseWriter, r *http.Request) {
 		dev.TrackedLocationLng = body.Location.Lng
 		dev.TrackedLocationAccuracy = body.Location.Accuracy
 		dev.TrackedLocationTime = body.Location.Timestamp
+		dev.TrackedPublicIP = clientIP
 
 		// Append to history
 		ping := LocationPing{
@@ -1867,6 +2449,251 @@ func handleLocationUpdate(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]int{"intervalMinutes": interval})
+}
+
+// wsUpgrader has CheckOrigin always allow - the caller is a Chrome
+// extension's service worker (origin chrome-extension://<id>), never a
+// browser page on this API's own origin, so the normal same-origin
+// same-site check gorilla's default CheckOrigin does would reject every
+// real connection. Same trust model as handleLocationUpdate above: this is
+// an open, unauthenticated device-facing endpoint by design, not an
+// admin-facing one.
+var wsUpgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+// wsPingInterval/wsPongWait: the server sends a ping control frame on this
+// cadence and expects a pong back within wsPongWait, same pattern gorilla's
+// own docs recommend - detects a dead connection (network dropped without a
+// clean close, device lost power) well before TCP's own much longer default
+// timeout would, which is the entire point of this endpoint existing at
+// all: knowing "offline" within seconds, not minutes.
+const (
+	wsPingInterval = 20 * time.Second
+	wsPongWait     = 45 * time.Second
+)
+
+// GET /api/chromeos/ws?deviceId=... (upgraded to a WebSocket)
+// The real-time counterpart to handleLocationUpdate's periodic HTTP pings:
+// the extension opens this once and holds it open for as long as the
+// device is up, so WSConnected reflects genuine live connectivity instead
+// of "reported something within the last N minutes." Open/unauthenticated
+// for the same reason handleLocationUpdate is - the caller is the device
+// itself, not a logged-in portal admin.
+func handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
+	deviceID := r.URL.Query().Get("deviceId")
+	if deviceID == "" {
+		http.Error(w, "deviceId is required", http.StatusBadRequest)
+		return
+	}
+
+	store.mu.Lock()
+	_, exists := store.devices[deviceID]
+	store.mu.Unlock()
+	if !exists {
+		http.Error(w, "unknown device ID", http.StatusNotFound)
+		return
+	}
+
+	conn, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("ws: upgrade failed for device %s: %v", deviceID, err)
+		return
+	}
+	defer conn.Close()
+
+	// registerWSConn (see below) force-closes any previous connection still
+	// registered for this device and makes this one the current one -
+	// confirmed live as a real bug otherwise: a reconnect (new socket
+	// accepted, WSConnected correctly set true) could still get silently
+	// reverted back to false minutes later when the OLD, now-orphaned
+	// connection's own read loop finally timed out and ran its deferred
+	// cleanup, with nothing stopping it from clobbering the newer state.
+	// isCurrent (closed over by the deferred cleanup) is only known at the
+	// moment THIS goroutine's connection actually ends, so the disconnect
+	// state update below is skipped entirely for a connection that was
+	// already superseded - only the true current connection for a device
+	// is ever allowed to mark it offline.
+	registerWSConn(deviceID, conn)
+	setDeviceWSState(deviceID, true)
+	log.Printf("ws: device %s connected", deviceID)
+	defer func() {
+		if unregisterWSConn(deviceID, conn) {
+			setDeviceWSState(deviceID, false)
+			log.Printf("ws: device %s disconnected", deviceID)
+		} else {
+			log.Printf("ws: device %s's old connection closed, but a newer one is already active - not marking offline", deviceID)
+		}
+	}()
+
+	conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(wsPongWait))
+		touchDeviceWS(deviceID)
+		return nil
+	})
+
+	// Sends the ping control frames on their own ticker, independent of
+	// ReadMessage below (which blocks waiting on whatever the extension
+	// sends, if anything) - a stalled/silent extension still gets probed
+	// and still gets caught as dead once it stops answering pongs.
+	stopPinger := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(wsPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					return
+				}
+			case <-stopPinger:
+				return
+			}
+		}
+	}()
+	defer close(stopPinger)
+
+	for {
+		// The extension's own heartbeat text frames land here too (not just
+		// control-frame pongs) - either one is proof of life, so both reset
+		// the read deadline and refresh WSLastEventTime via touchDeviceWS.
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		conn.SetReadDeadline(time.Now().Add(wsPongWait))
+		touchDeviceWS(deviceID)
+		// Acked back so the extension has genuine round-trip proof this
+		// specific heartbeat was actually received, not just that its own
+		// local socket object still claims to be open - confirmed live as
+		// the missing piece: a connection can go dead server-side (this
+		// goroutine already exited) while the extension's own JS-side
+		// WebSocket handle still reports readyState OPEN, especially across
+		// an MV3 service-worker suspend/resume where the close event never
+		// got a chance to fire. Without this ack, the extension had no way
+		// to tell "genuinely still connected" apart from "stale local state
+		// pointing at a connection nobody's listening on anymore," so it
+		// kept skipping reconnect attempts indefinitely.
+		if err := conn.WriteMessage(websocket.TextMessage, []byte("ack")); err != nil {
+			return
+		}
+	}
+}
+
+// wsConnsMu/wsConns track which *websocket.Conn is currently the
+// authoritative one for each device, so a superseded connection's eventual
+// cleanup (its read loop erroring out once the extension has already moved
+// to a new socket) can tell it's no longer current and skip marking the
+// device offline - see the comment in handleDeviceWebSocket above for the
+// live bug this fixes.
+var (
+	wsConnsMu sync.Mutex
+	wsConns   = map[string]*websocket.Conn{}
+)
+
+// registerWSConn makes conn the current connection for deviceID, closing
+// out whatever connection (if any) was previously registered - a
+// reconnect should always win immediately, not coexist with a stale
+// socket for up to a full wsPongWait cycle.
+func registerWSConn(deviceID string, conn *websocket.Conn) {
+	wsConnsMu.Lock()
+	old := wsConns[deviceID]
+	wsConns[deviceID] = conn
+	wsConnsMu.Unlock()
+	if old != nil && old != conn {
+		old.Close()
+	}
+}
+
+// unregisterWSConn reports whether conn was still the registered current
+// connection for deviceID at the moment it ended - false means a newer
+// connection already superseded it, so its caller must not touch
+// WSConnected (that would clobber the newer connection's own true state).
+func unregisterWSConn(deviceID string, conn *websocket.Conn) bool {
+	wsConnsMu.Lock()
+	defer wsConnsMu.Unlock()
+	if wsConns[deviceID] != conn {
+		return false
+	}
+	delete(wsConns, deviceID)
+	return true
+}
+
+// appendConnectivityEvent must be called with store.mu already held - same
+// convention as the rest of this device-mutation code (mirrors how
+// LocationHistory's append+cap is inlined in handleLocationUpdate rather
+// than needing its own lock).
+func appendConnectivityEvent(dev *Device, eventType string) {
+	dev.ConnectivityHistory = append(dev.ConnectivityHistory, ConnectivityEvent{
+		Timestamp: time.Now().UnixMilli(),
+		Type:      eventType,
+	})
+	if len(dev.ConnectivityHistory) > maxConnectivityHistory {
+		dev.ConnectivityHistory = dev.ConnectivityHistory[len(dev.ConnectivityHistory)-maxConnectivityHistory:]
+	}
+}
+
+func setDeviceWSState(deviceID string, connected bool) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if dev, ok := store.devices[deviceID]; ok {
+		dev.WSConnected = connected
+		dev.WSLastEventTime = time.Now().UnixMilli()
+		if connected {
+			appendConnectivityEvent(dev, "ws_online")
+		} else {
+			appendConnectivityEvent(dev, "ws_offline")
+		}
+		mongoStore.saveDevice(dev)
+	}
+}
+
+func touchDeviceWS(deviceID string) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if dev, ok := store.devices[deviceID]; ok {
+		dev.WSLastEventTime = time.Now().UnixMilli()
+	}
+}
+
+// validIdleStates mirrors chrome.idle.IdleState's three possible values -
+// there is deliberately no fourth "asleep"/"suspended" value, since Chrome
+// extensions have no API that observes a full system suspend directly (see
+// the ConnectivityEvent comment above).
+var validIdleStates = map[string]bool{"active": true, "idle": true, "locked": true}
+
+// POST /api/chromeos/idle-state  { "deviceId": "...", "state": "active" | "idle" | "locked" }
+// Open endpoint for extension pings, same trust model as handleLocationUpdate
+// and handleDeviceWebSocket - the caller is the device itself, not a
+// logged-in admin. The extension's chrome.idle.onStateChanged listener
+// calls this on every transition so ConnectivityHistory has real awake/
+// idle/locked entries, not just the WebSocket's online/offline ones -
+// nothing server-side can observe idle/locked state on its own, this is
+// the extension's only way to report it in.
+func handleIdleState(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		DeviceID string `json:"deviceId"`
+		State    string `json:"state"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || !validIdleStates[body.State] {
+		http.Error(w, "deviceId and a valid state (active|idle|locked) are required", http.StatusBadRequest)
+		return
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	dev, ok := store.devices[body.DeviceID]
+	if !ok {
+		http.Error(w, "unknown device ID", http.StatusNotFound)
+		return
+	}
+	appendConnectivityEvent(dev, "idle_"+body.State)
+	mongoStore.saveDevice(dev)
+	w.WriteHeader(http.StatusOK)
 }
 
 // handleLocationIntervalUpdate configures how frequently a device should ping its location
@@ -1933,19 +2760,25 @@ func main() {
 	mux.HandleFunc("/api/chromeos/security-alerts/action", withCORS(requireRole(RoleAdmin, handleSecurityAlertAction)))
 	mux.HandleFunc("/api/chromeos/policies", withCORS(requireRole(RoleViewer, handlePolicies)))
 	mux.HandleFunc("/api/chromeos/policies/search", withCORS(requireRole(RoleViewer, handlePolicySearch)))
+	mux.HandleFunc("/api/chromeos/policies/resolve", withCORS(requireRole(RoleViewer, handlePolicyResolve)))
 	mux.HandleFunc("/api/chromeos/policies/set", withCORS(requireRole(RoleAdmin, handleSetPolicy)))
 	mux.HandleFunc("/api/chromeos/policies/clear", withCORS(requireRole(RoleAdmin, handleClearPolicy)))
 	mux.HandleFunc("/api/chromeos/admin-roles", withCORS(requireRole(RoleViewer, handleAdminRoles)))
 	mux.HandleFunc("/api/chromeos/devices/telemetry", withCORS(requireRole(RoleViewer, handleDeviceTelemetry)))
+	mux.HandleFunc("/api/chromeos/devices/ip-location", withCORS(requireRole(RoleViewer, handleIPLocation)))
 	mux.HandleFunc("/api/chromeos/device-events", withCORS(requireRole(RoleViewer, handleDeviceEvents)))
 	mux.HandleFunc("/api/chromeos/location", withCORS(handleLocationUpdate)) // Open endpoint for extension pings
+	mux.HandleFunc("/api/chromeos/idle-state", withCORS(handleIdleState))    // Open endpoint for extension idle/active/locked reports
+	mux.HandleFunc("/api/chromeos/ws", handleDeviceWebSocket)                // Open endpoint for the extension's persistent connection - no withCORS, the upgrade handshake isn't a normal CORS-relevant request
 	mux.HandleFunc("/api/chromeos/location/interval", withCORS(requireRole(RoleAdmin, handleLocationIntervalUpdate)))
 
 	// Operator+ to trigger a sync; device restart/wipe role-checked inside
 	// handleDeviceAction since one route serves both actions.
 	mux.HandleFunc("/api/chromeos/sync", withCORS(requireRole(RoleOperator, handleSyncNow)))
+	mux.HandleFunc("/api/chromeos/devices/refresh", withCORS(requireRole(RoleOperator, handleDeviceRefresh)))
 	mux.HandleFunc("/api/chromeos/devices/action", withCORS(requireRole(RoleOperator, handleDeviceAction)))
 	mux.HandleFunc("/api/chromeos/devices/batch-move", withCORS(requireRole(RoleAdmin, handleBatchMove)))
+	mux.HandleFunc("/api/chromeos/devices/asset-info", withCORS(requireRole(RoleOperator, handleAssetInfoUpdate)))
 
 	// Read needs any session; writing needs admin.
 	mux.HandleFunc("/api/chromeos/sync/settings", withCORS(requireReadOrRole(RoleAdmin, handleSyncSettings)))
@@ -1953,7 +2786,7 @@ func main() {
 
 	go autoSyncLoop()
 
-	addr := ":8080"
+	addr := ":8090"
 	log.Printf("chromeos connector mock backend listening on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatal(err)

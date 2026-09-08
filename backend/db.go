@@ -208,19 +208,32 @@ func (m *mongoPersistence) loadDevices() map[string]*Device {
 }
 
 type settingsDoc struct {
-	ID               string     `bson:"_id"`
+	ID string `bson:"_id"`
+	// SyncIntervalMins is kept around read-only for documents written before
+	// sub-minute intervals (the "Always" ~30s preset) existed - a whole
+	// number of minutes can't represent that, so SyncIntervalSecs is now the
+	// source of truth going forward and this old field is only consulted as
+	// a fallback for documents that predate it (see loadSettings below).
 	SyncIntervalMins int        `bson:"syncIntervalMins"`
+	SyncIntervalSecs int        `bson:"syncIntervalSecs"`
 	Thresholds       Thresholds `bson:"thresholds"`
 }
 
-func (m *mongoPersistence) saveSettings(syncIntervalMins int, thresholds Thresholds) {
+func (m *mongoPersistence) saveSettings(syncIntervalSecs int, thresholds Thresholds) {
 	if m == nil {
 		return
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), mongoOpTimeout)
 		defer cancel()
-		doc := settingsDoc{ID: singletonID, SyncIntervalMins: syncIntervalMins, Thresholds: thresholds}
+		// SyncIntervalMins is also written (rounded, minimum 1) purely so
+		// any older tooling/reporting that still reads the old field sees a
+		// sane approximation rather than a stale value.
+		mins := syncIntervalSecs / 60
+		if mins < 1 {
+			mins = 1
+		}
+		doc := settingsDoc{ID: singletonID, SyncIntervalMins: mins, SyncIntervalSecs: syncIntervalSecs, Thresholds: thresholds}
 		if _, err := m.settingsColl.ReplaceOne(ctx, singletonFilter, doc, options.Replace().SetUpsert(true)); err != nil {
 			log.Printf("mongo: saving settings failed (non-fatal): %v", err)
 		}
@@ -240,7 +253,14 @@ func (m *mongoPersistence) loadSettings() (int, Thresholds, bool) {
 		}
 		return 0, Thresholds{}, false
 	}
-	return doc.SyncIntervalMins, doc.Thresholds, true
+	if doc.SyncIntervalSecs > 0 {
+		return doc.SyncIntervalSecs, doc.Thresholds, true
+	}
+	// Pre-migration document: only the whole-minutes field was ever written.
+	if doc.SyncIntervalMins > 0 {
+		return doc.SyncIntervalMins * 60, doc.Thresholds, true
+	}
+	return 0, doc.Thresholds, true
 }
 
 type directoryCacheDoc struct {
@@ -331,16 +351,27 @@ func (m *mongoPersistence) loadActions() map[string]*DeviceAction {
 	return out
 }
 
+// sessionDoc mirrors session's fields explicitly rather than embedding the
+// (unexported) session type - confirmed live that embedding it silently
+// dropped Username/Role/Expiry from every saved document (the bson v2
+// driver skips unexported struct fields, and an embedded field named after
+// an unexported type is itself unexported), leaving only _id behind. Every
+// persisted session therefore decoded back with a zero-value Expiry
+// (year 1), which loadSessions' own expiry check then always treated as
+// already expired - so no login ever actually survived a backend restart,
+// despite the session/Mongo plumbing otherwise looking correct.
 type sessionDoc struct {
-	ID string `bson:"_id"` // the bearer token itself
-	session
+	ID       string    `bson:"_id"` // the bearer token itself
+	Username string    `bson:"username"`
+	Role     string    `bson:"role"`
+	Expiry   time.Time `bson:"expiry"`
 }
 
 func (m *mongoPersistence) saveSession(token string, s *session) {
 	if m == nil || s == nil {
 		return
 	}
-	doc := sessionDoc{ID: token, session: *s}
+	doc := sessionDoc{ID: token, Username: s.Username, Role: s.Role, Expiry: s.Expiry}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), mongoOpTimeout)
 		defer cancel()
@@ -386,12 +417,11 @@ func (m *mongoPersistence) loadSessions() map[string]*session {
 		if err := cur.Decode(&doc); err != nil {
 			continue
 		}
-		if now.After(doc.session.Expiry) {
+		if now.After(doc.Expiry) {
 			expired = append(expired, doc.ID)
 			continue
 		}
-		s := doc.session
-		out[doc.ID] = &s
+		out[doc.ID] = &session{Username: doc.Username, Role: doc.Role, Expiry: doc.Expiry}
 	}
 	if len(expired) > 0 {
 		go func() {
@@ -486,8 +516,10 @@ func hydrateStoreFromMongo() {
 	}
 	store.devices = mongoStore.loadDevices()
 	store.actions = mongoStore.loadActions()
-	if mins, thresholds, ok := mongoStore.loadSettings(); ok {
-		store.syncIntervalMins = mins
+	if secs, thresholds, ok := mongoStore.loadSettings(); ok {
+		if secs > 0 {
+			store.syncIntervalSecs = secs
+		}
 		store.thresholds = thresholds
 	}
 	store.users, store.orgUnits, store.churn, store.groups = mongoStore.loadDirectoryCache()

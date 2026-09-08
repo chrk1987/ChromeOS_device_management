@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"net/http"
 	"os"
@@ -87,6 +88,50 @@ func shortenGoogleError(err error) error {
 	return err
 }
 
+// isTransientGoogleErr: true for a Google-side 5xx (confirmed live as a
+// real, if infrequent, failure mode - e.g. a bare 502 with an HTML error
+// page instead of a JSON body straight from Google's edge infrastructure,
+// not anything this connector or the customer's domain did wrong). Never
+// true for a 4xx or auth failure - those won't succeed on a retry, so
+// retrying them would just slow down a real failure.
+func isTransientGoogleErr(err error) bool {
+	var gerr *googleapi.Error
+	if errors.As(err, &gerr) {
+		return gerr.Code >= 500
+	}
+	// shortenGoogleError's "HTTP %d: %s" branch re-wraps a googleapi.Error
+	// that DOES have a JSON-parsed Message into a plain error that no longer
+	// carries the original *googleapi.Error for errors.As to find above -
+	// this catches that case by its own formatted prefix instead.
+	for _, code := range []string{"HTTP 500:", "HTTP 502:", "HTTP 503:", "HTTP 504:"} {
+		if strings.Contains(err.Error(), code) {
+			return true
+		}
+	}
+	return false
+}
+
+// retryTransientGoogleErr retries fn up to 2 extra times (3 attempts total)
+// with a short backoff, but only when the failure looks transient
+// (isTransientGoogleErr) - used around the individual Chrome Policy API
+// calls Policy compliance's tab load fires ~19 of concurrently on every
+// load, where a single flaky 502 previously either broke the whole tab
+// (the curated schemas) or silently dropped one category (see
+// isTransientGoogleErr's callers).
+func retryTransientGoogleErr(fn func() error) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 400 * time.Millisecond)
+		}
+		err = fn()
+		if err == nil || !isTransientGoogleErr(err) {
+			return err
+		}
+	}
+	return err
+}
+
 // GoogleClient is the seam between your sync/action logic and Google.
 // The mock and the real implementation both satisfy this, so main.go
 // never has to know which one it's talking to.
@@ -95,6 +140,11 @@ type GoogleClient interface {
 	// delegation has been authorized yet (the one manual step).
 	Probe() error
 	ListDevices() ([]*Device, error)
+	// GetDevice does a live, single-device fetch (Chromeosdevices.Get)
+	// instead of waiting for the next fleet-wide ListDevices-based sync -
+	// used by the Devices table's per-row "Refresh from Google" action to
+	// narrow the portal's own sync lag on demand for just that device.
+	GetDevice(deviceID string) (*Device, error)
 	// DoAction returns an optional result string alongside the error - only
 	// populated for actions that produce one (currently "crd", the Chrome
 	// Remote Desktop session URL, confirmed live to only be available via a
@@ -104,11 +154,22 @@ type GoogleClient interface {
 	// (Chromeosdevices.MoveDevicesToOu) instead of N individual Patch calls -
 	// one HTTP request for the whole selection instead of one per device.
 	BatchMoveDevices(deviceIDs []string, orgUnit string) error
+	// UpdateAssetInfo writes the same free-text fields Admin console's own
+	// device "Asset info" panel edits (annotatedLocation/notes/orderNumber) -
+	// this connector only ever read them before; this is its first write
+	// path for plain device metadata (as opposed to a state-changing action
+	// like disable/wipe/move). All three are always sent together since
+	// Chromeosdevices.Patch overwrites whichever fields are set on the
+	// request body - the caller is expected to pass the device's current
+	// value for any field it isn't changing, not to omit it.
+	UpdateAssetInfo(deviceID, location, notes, orderNumber string) error
 	// ListDeviceEvents uses the Chrome Management Telemetry API's Events feed
 	// (Customers.Telemetry.Events.List) - a genuinely different data source
 	// from GetDeviceTelemetry's point-in-time snapshots: this is the actual
 	// event stream (network changes, USB, app installs, audio/WiFi issues).
-	ListDeviceEvents(eventTypes []string, since time.Time) ([]*DeviceEvent, error)
+	// deviceID narrows to one device's events (server-side, via the API's
+	// own device_id filter field) when non-empty; empty means fleet-wide.
+	ListDeviceEvents(eventTypes []string, since time.Time, deviceID string) ([]*DeviceEvent, error)
 	// ListUsers and ListOrgUnits use the admin.directory.user.readonly and
 	// admin.directory.orgunit.readonly scopes - already part of the
 	// connect wizard's requested scopes, just previously unused.
@@ -159,8 +220,13 @@ type GoogleClient interface {
 	// JSON object whose one key is the schema's field name (matches the
 	// shape ListPolicies already returns) - that key doubles as the API's
 	// required UpdateMask, so there's no separate hardcoded field-name table
-	// to keep in sync per schema.
-	SetPolicy(orgUnitPath, schemaName string, valueJSON json.RawMessage) error
+	// to keep in sync per schema. appID is optional and only needed for
+	// per-app-targeted schemas (e.g. chrome.users.apps.InstallType, the
+	// force-install-a-specific-extension policy) - the Chrome Policy API
+	// puts the app in additionalTargetKeys.app_id rather than in the value
+	// payload for these, unlike an org-unit-wide setting. Pass "" for any
+	// schema that targets the whole org unit instead of one app.
+	SetPolicy(orgUnitPath, schemaName string, valueJSON json.RawMessage, appID string) error
 	// ClearPolicy removes an explicit override on this org unit so it
 	// inherits from its parent again - the Chrome Policy API's BatchInherit,
 	// equivalent to Admin console's "Inherit" toggle.
@@ -177,6 +243,13 @@ type GoogleClient interface {
 	// Google's own live catalog and editing through SetPolicy/ClearPolicy
 	// above is the same generic mechanism, applied honestly.
 	SearchPolicySchemas(query string) ([]*PolicySchemaInfo, error)
+	// ResolvePolicySchema resolves one arbitrary schema (found via
+	// SearchPolicySchemas, "Browse policies") against the root org unit -
+	// the same Resolve call ListPolicies already makes for the curated
+	// list, just for a single caller-chosen schema instead of the fixed
+	// set. This is what lets an admin "add" a browsed schema into Policy
+	// compliance with a real resolved value, not just a static row.
+	ResolvePolicySchema(schemaName, displayName, category string) (*PolicyValue, error)
 	// ListAdminRoles uses admin.directory.rolemanagement.readonly - a new,
 	// isolated scope - to show who holds which Google Admin role.
 	ListAdminRoles() ([]*AdminRoleAssignment, error)
@@ -189,13 +262,82 @@ type GoogleClient interface {
 	GetDeviceTelemetry(deviceID string) (*DeviceTelemetry, error)
 }
 
+// ---------- Disconnected (real-mode "Disconnect" target - no live client at all) ----------
+
+// errNotConnected is what every disconnectedGoogleClient method returns.
+var errNotConnected = errors.New("not connected - reconnect via Setup Wizard")
+
+// disconnectedGoogleClient is installed by handleDisconnect in place of
+// whatever real/mock client was live before - confirmed live as a real gap
+// otherwise: handleDisconnect only ever reset store.conn/store.devices, not
+// store.google itself, so the actual authenticated Google API client
+// (real domain-wide-delegation credentials, already fully authorized)
+// stayed alive in memory. The Setup Wizard's own polling
+// (handleConnectStatus calling store.google.Probe()) would then succeed
+// immediately using those still-valid stale credentials, silently
+// "reconnecting" the account without the admin ever uploading a new
+// service account key - exactly backwards from what "Disconnect" is
+// supposed to mean. Every method here fails the same clear way instead, so
+// nothing can silently keep working on old credentials after a disconnect,
+// and a genuinely fresh handleConnectUpload/handleInit is required to
+// reinstall a real client before anything Google-backed works again.
+type disconnectedGoogleClient struct{}
+
+func (disconnectedGoogleClient) Probe() error                      { return errNotConnected }
+func (disconnectedGoogleClient) ListDevices() ([]*Device, error)   { return nil, errNotConnected }
+func (disconnectedGoogleClient) GetDevice(string) (*Device, error) { return nil, errNotConnected }
+func (disconnectedGoogleClient) DoAction(string, string, string) (string, error) {
+	return "", errNotConnected
+}
+func (disconnectedGoogleClient) BatchMoveDevices([]string, string) error { return errNotConnected }
+func (disconnectedGoogleClient) UpdateAssetInfo(string, string, string, string) error {
+	return errNotConnected
+}
+func (disconnectedGoogleClient) ListDeviceEvents([]string, time.Time, string) ([]*DeviceEvent, error) {
+	return nil, errNotConnected
+}
+func (disconnectedGoogleClient) ListUsers() ([]*DirectoryUser, error)  { return nil, errNotConnected }
+func (disconnectedGoogleClient) ListOrgUnits() ([]*OrgUnitInfo, error) { return nil, errNotConnected }
+func (disconnectedGoogleClient) ListChromeReports() (*ChromeReports, error) {
+	return nil, errNotConnected
+}
+func (disconnectedGoogleClient) ListChurn() ([]*ChurnRecord, error) { return nil, errNotConnected }
+func (disconnectedGoogleClient) ListGroups() ([]*GroupInfo, error)  { return nil, errNotConnected }
+func (disconnectedGoogleClient) ListMobileDevices() ([]*MobileDeviceInfo, error) {
+	return nil, errNotConnected
+}
+func (disconnectedGoogleClient) ListAuditLog() (*AuditLog, error) { return nil, errNotConnected }
+func (disconnectedGoogleClient) ListSecurityAlerts() ([]*SecurityAlert, error) {
+	return nil, errNotConnected
+}
+func (disconnectedGoogleClient) DeleteAlert(string) error                 { return errNotConnected }
+func (disconnectedGoogleClient) UndeleteAlert(string) error               { return errNotConnected }
+func (disconnectedGoogleClient) SubmitAlertFeedback(string, string) error { return errNotConnected }
+func (disconnectedGoogleClient) ListPolicies() ([]*PolicyValue, error)    { return nil, errNotConnected }
+func (disconnectedGoogleClient) SetPolicy(string, string, json.RawMessage, string) error {
+	return errNotConnected
+}
+func (disconnectedGoogleClient) ClearPolicy(string, string) error { return errNotConnected }
+func (disconnectedGoogleClient) SearchPolicySchemas(string) ([]*PolicySchemaInfo, error) {
+	return nil, errNotConnected
+}
+func (disconnectedGoogleClient) ResolvePolicySchema(string, string, string) (*PolicyValue, error) {
+	return nil, errNotConnected
+}
+func (disconnectedGoogleClient) ListAdminRoles() ([]*AdminRoleAssignment, error) {
+	return nil, errNotConnected
+}
+func (disconnectedGoogleClient) GetDeviceTelemetry(string) (*DeviceTelemetry, error) {
+	return nil, errNotConnected
+}
+
 // ---------- Mock (default, zero real credentials needed) ----------
 
 type mockGoogleClient struct {
 	mu              sync.Mutex
 	policyOverrides map[string]json.RawMessage // schemaName -> last value set via SetPolicy, until ClearPolicy
 	deletedAlerts   map[string]bool            // alertID -> soft-deleted via DeleteAlert, until UndeleteAlert
-	alertFeedback   map[string]string           // alertID -> last feedback type submitted
+	alertFeedback   map[string]string          // alertID -> last feedback type submitted
 }
 
 func (m *mockGoogleClient) Probe() error { return nil } // always "authorized" in mock mode
@@ -203,6 +345,16 @@ func (m *mockGoogleClient) Probe() error { return nil } // always "authorized" i
 func (m *mockGoogleClient) ListDevices() ([]*Device, error) {
 	time.Sleep(1500 * time.Millisecond) // simulate API latency
 	return mockDeviceList(), nil
+}
+
+func (m *mockGoogleClient) GetDevice(deviceID string) (*Device, error) {
+	time.Sleep(500 * time.Millisecond) // simulate API latency
+	for _, d := range mockDeviceList() {
+		if d.ID == deviceID {
+			return d, nil
+		}
+	}
+	return nil, fmt.Errorf("device not found: %s", deviceID)
 }
 
 func (m *mockGoogleClient) DoAction(deviceID, action, payload string) (string, error) {
@@ -223,13 +375,22 @@ func (m *mockGoogleClient) BatchMoveDevices(deviceIDs []string, orgUnit string) 
 	return nil
 }
 
-func (m *mockGoogleClient) ListDeviceEvents(eventTypes []string, since time.Time) ([]*DeviceEvent, error) {
+func (m *mockGoogleClient) UpdateAssetInfo(deviceID, location, notes, orderNumber string) error {
+	time.Sleep(500 * time.Millisecond) // simulate API latency
+	return nil
+}
+
+func (m *mockGoogleClient) ListDeviceEvents(eventTypes []string, since time.Time, deviceID string) ([]*DeviceEvent, error) {
 	now := time.Now()
 	all := []*DeviceEvent{
 		{ID: randID("evt"), DeviceID: "mock-dev-1", EventType: "NETWORK_STATE_CHANGE", ReportTime: now.Add(-8 * time.Minute), UserEmail: "alice.chen@example.com", Description: "Network connection state changed to NOT_CONNECTED"},
 		{ID: randID("evt"), DeviceID: "mock-dev-2", EventType: "USB_ADDED", ReportTime: now.Add(-25 * time.Minute), UserEmail: "raj.patel@example.com", Description: "USB device connected: SanDisk Ultra USB 3.0"},
 		{ID: randID("evt"), DeviceID: "mock-dev-4", EventType: "WIFI_SIGNAL_STRENGTH_LOW", ReportTime: now.Add(-40 * time.Minute), UserEmail: "david.kim@example.com", Description: "WiFi signal strength dropped below -70dBm"},
-		{ID: randID("evt"), DeviceID: "mock-dev-1", EventType: "APP_INSTALLED", ReportTime: now.Add(-2 * time.Hour), UserEmail: "alice.chen@example.com", Description: "App installed: Zoom"},
+		{ID: randID("evt"), DeviceID: "mock-dev-1", EventType: "APP_INSTALLED", ReportTime: now.Add(-2 * time.Hour), UserEmail: "alice.chen@example.com", Description: "App installed: Zoom", AppId: "mock-app-zoom"},
+		{ID: randID("evt"), DeviceID: "mock-dev-1", EventType: "USB_ADDED", ReportTime: now.Add(-70 * time.Minute), UserEmail: "alice.chen@example.com", Description: "USB device connected: Cruzer Blade"},
+		{ID: randID("evt"), DeviceID: "mock-dev-1", EventType: "USB_REMOVED", ReportTime: now.Add(-65 * time.Minute), UserEmail: "alice.chen@example.com", Description: "USB device disconnected"},
+		{ID: randID("evt"), DeviceID: "mock-dev-1", EventType: "NETWORK_HTTPS_LATENCY_CHANGE", ReportTime: now.Add(-90 * time.Minute), Description: "HTTPS latency state: PROBLEM"},
+		{ID: randID("evt"), DeviceID: "mock-dev-1", EventType: "NETWORK_HTTPS_LATENCY_CHANGE", ReportTime: now.Add(-100 * time.Minute), Description: "HTTPS latency state: RECOVERY"},
 		{ID: randID("evt"), DeviceID: "mock-dev-3", EventType: "AUDIO_SEVERE_UNDERRUN", ReportTime: now.Add(-3 * time.Hour), UserEmail: "maria.lopez@example.com", Description: "Audio buffer underrun for 6.2s"},
 		{ID: randID("evt"), DeviceID: "mock-dev-2", EventType: "NETWORK_HTTPS_LATENCY_CHANGE", ReportTime: now.Add(-5 * time.Hour), UserEmail: "raj.patel@example.com", Description: "HTTPS latency problem detected"},
 	}
@@ -243,6 +404,9 @@ func (m *mockGoogleClient) ListDeviceEvents(eventTypes []string, since time.Time
 			continue
 		}
 		if len(typeFilter) > 0 && !typeFilter[e.EventType] {
+			continue
+		}
+		if deviceID != "" && e.DeviceID != deviceID {
 			continue
 		}
 		out = append(out, e)
@@ -382,10 +546,59 @@ func (m *mockGoogleClient) SubmitAlertFeedback(alertID, feedbackType string) err
 var mockPolicyDefaults = map[string]string{
 	"chrome.users.SafeBrowsingProtectionLevel": `{"safeBrowsingProtectionLevel":"ENHANCED_PROTECTION"}`,
 	"chrome.devices.GuestMode":                 `{"guestModeEnabled":false}`,
-	"chrome.users.DeveloperTools":               `{"developerToolsAvailability":"DEVELOPER_TOOLS_DISABLED"}`,
-	"chrome.users.ManagedBookmarks":             `{"managedBookmarks":[{"name":"Company intranet","url":"https://intranet.example.com"}]}`,
-	"chrome.users.AudioCaptureAllowed":          `{"audioCaptureAllowed":true}`,
-	"chrome.devices.kiosk.KioskAppSettings":     `{"kioskAppId":"mock-kiosk-app-id"}`,
+	"chrome.users.DeveloperTools":              `{"developerToolsAvailability":"DEVELOPER_TOOLS_DISABLED"}`,
+	"chrome.users.ManagedBookmarks":            `{"managedBookmarks":[{"name":"Company intranet","url":"https://intranet.example.com"}]}`,
+	"chrome.users.AudioCaptureAllowed":         `{"audioCaptureAllowed":true}`,
+	"chrome.devices.kiosk.KioskAppSettings":    `{"kioskAppId":"mock-kiosk-app-id"}`,
+}
+
+// mockPolicySchemaFields gives field metadata (name/description/known
+// values) for the curated schemas whose real Chrome policy shape is well
+// documented and stable enough to demo confidently - lets the mock client's
+// Policy compliance tab render the same friendly per-field form (dropdowns,
+// toggles) the real client gets from Google's live schema catalog, instead
+// of a raw JSON box. Deliberately not filled in for every curated schema:
+// a few (screen lock, forced re-enrollment) don't have a field shape this
+// codebase has confirmed live, so those stay on the raw-JSON fallback
+// rather than guess at a name that could be wrong.
+var mockPolicySchemaFields = map[string][]PolicySchemaField{
+	"chrome.users.SafeBrowsingProtectionLevel": {
+		{Name: "safeBrowsingProtectionLevel", Description: "How aggressively Safe Browsing warns about dangerous sites and downloads.",
+			KnownValues: []string{"DISABLED", "STANDARD_PROTECTION", "ENHANCED_PROTECTION"}, DefaultValue: "STANDARD_PROTECTION"},
+	},
+	"chrome.devices.GuestMode": {
+		{Name: "guestModeEnabled", Description: "Allow signing in as a guest without a Google Account.", DefaultValue: true},
+	},
+	"chrome.users.DeveloperTools": {
+		{Name: "developerToolsAvailability", Description: "Whether users can open Chrome DevTools.",
+			KnownValues: []string{"DEVELOPER_TOOLS_ALLOWED", "DEVELOPER_TOOLS_DISABLED", "DEVELOPER_TOOLS_DISABLED_ON_EXTENSIONS"}, DefaultValue: "DEVELOPER_TOOLS_ALLOWED"},
+	},
+	"chrome.devices.DevicePowerwashAllowed": {
+		{Name: "devicePowerwashAllowed", Description: "Allow users to factory-reset (powerwash) the device from the sign-in screen.", DefaultValue: true},
+	},
+	"chrome.users.UrlBlocking": {
+		{Name: "urlBlocklist", Description: "URL patterns blocked from loading."},
+		{Name: "chromeInternalUrlsBlocked", Description: "Also block internal chrome:// pages covered by the blocklist.", DefaultValue: false},
+	},
+}
+
+// mockFieldsForSchema looks up field metadata for a curatedPolicySchemas
+// entry - mockPolicySchemaFields first (the Security schemas' hand-written
+// entries above), falling back to mockPolicySchemaCatalog (which already
+// carries real field names/descriptions for the app-install schemas, since
+// SearchPolicySchemas/Browse policies needs those regardless). Keeps the
+// app-install schemas' field metadata defined in one place rather than
+// duplicated into mockPolicySchemaFields too.
+func mockFieldsForSchema(schemaName string) []PolicySchemaField {
+	if f, ok := mockPolicySchemaFields[schemaName]; ok {
+		return f
+	}
+	for _, s := range mockPolicySchemaCatalog {
+		if s.SchemaName == schemaName {
+			return s.Fields
+		}
+	}
+	return nil
 }
 
 // ListPolicies (mock) mirrors the real client's shape: the security-focused
@@ -403,7 +616,7 @@ func (m *mockGoogleClient) ListPolicies() ([]*PolicyValue, error) {
 		if ov, ok := m.policyOverrides[schema.schema]; ok {
 			value = string(ov)
 		}
-		out = append(out, &PolicyValue{SchemaName: schema.schema, DisplayName: schema.displayName, Category: "Security", Value: value})
+		out = append(out, &PolicyValue{SchemaName: schema.schema, DisplayName: schema.displayName, Category: schema.category, Value: value, Fields: mockFieldsForSchema(schema.schema)})
 	}
 	for _, cat := range curatedCategories {
 		matches := mockSearchPolicySchemas(cat.keyword)
@@ -415,17 +628,18 @@ func (m *mockGoogleClient) ListPolicies() ([]*PolicyValue, error) {
 		if ov, ok := m.policyOverrides[match.SchemaName]; ok {
 			value = string(ov)
 		}
-		out = append(out, &PolicyValue{SchemaName: match.SchemaName, DisplayName: shortSchemaName(match.SchemaName), Category: cat.displayName, Value: value})
+		out = append(out, &PolicyValue{SchemaName: match.SchemaName, DisplayName: shortSchemaName(match.SchemaName), Category: cat.displayName, Value: value, Fields: match.Fields})
 	}
 	return out, nil
 }
 
 // SetPolicy (mock) just records the value in memory, keyed by schema name
-// only - the mock's ListPolicies always resolves against the root OU
-// anyway, so there's nothing more granular to fake here. Still validates
-// the single-field-object shape the real client requires, so a bad request
-// fails the same way in both modes.
-func (m *mockGoogleClient) SetPolicy(orgUnitPath, schemaName string, valueJSON json.RawMessage) error {
+// (plus appID when targeting a specific app/extension, so two different
+// apps' InstallType overrides don't collide) - the mock's ListPolicies
+// always resolves against the root OU anyway, so there's nothing more
+// granular to fake here. Still validates the single-field-object shape the
+// real client requires, so a bad request fails the same way in both modes.
+func (m *mockGoogleClient) SetPolicy(orgUnitPath, schemaName string, valueJSON json.RawMessage, appID string) error {
 	time.Sleep(500 * time.Millisecond) // simulate API latency
 	if _, err := policyUpdateMask(valueJSON); err != nil {
 		return err
@@ -435,7 +649,11 @@ func (m *mockGoogleClient) SetPolicy(orgUnitPath, schemaName string, valueJSON j
 	if m.policyOverrides == nil {
 		m.policyOverrides = map[string]json.RawMessage{}
 	}
-	m.policyOverrides[schemaName] = valueJSON
+	key := schemaName
+	if appID != "" {
+		key = schemaName + "|" + appID
+	}
+	m.policyOverrides[key] = valueJSON
 	return nil
 }
 
@@ -456,12 +674,12 @@ var mockPolicySchemaCatalog = []*PolicySchemaInfo{
 	{
 		SchemaName: "chrome.users.apps.ExtensionInstallForcelist", Category: "Apps and extensions",
 		Description: "Extensions and apps automatically installed and enforced, users cannot remove them.",
-		Fields: []PolicySchemaField{{Name: "extensionInstallForcelist", Description: "List of extension IDs (optionally with an update URL) to force-install."}},
+		Fields:      []PolicySchemaField{{Name: "extensionInstallForcelist", Description: "List of extension IDs (optionally with an update URL) to force-install."}},
 	},
 	{
 		SchemaName: "chrome.users.apps.ExtensionInstallBlocklist", Category: "Apps and extensions",
 		Description: "Extensions and apps that are blocked from installation, or '*' to block all except allowlisted ones.",
-		Fields: []PolicySchemaField{{Name: "extensionInstallBlocklist", Description: "List of blocked extension IDs, or [\"*\"] for all."}},
+		Fields:      []PolicySchemaField{{Name: "extensionInstallBlocklist", Description: "List of blocked extension IDs, or [\"*\"] for all."}},
 	},
 	{
 		SchemaName: "chrome.devices.NetworkConfiguration", Category: "Network",
@@ -535,6 +753,25 @@ func (m *mockGoogleClient) SearchPolicySchemas(query string) ([]*PolicySchemaInf
 	return mockSearchPolicySchemas(query), nil
 }
 
+// ResolvePolicySchema (mock): same "untouched schema shows, just unset"
+// behavior as ListPolicies - value is empty unless this exact schema
+// happens to already be one of the ones ListPolicies' static fixtures set.
+func (m *mockGoogleClient) ResolvePolicySchema(schemaName, displayName, category string) (*PolicyValue, error) {
+	time.Sleep(300 * time.Millisecond) // simulate API latency
+	existing, _ := m.ListPolicies()
+	for _, p := range existing {
+		if p.SchemaName == schemaName {
+			return &PolicyValue{SchemaName: schemaName, DisplayName: displayName, Category: category, Value: p.Value, Fields: p.Fields}, nil
+		}
+	}
+	for _, s := range mockPolicySchemaCatalog {
+		if s.SchemaName == schemaName {
+			return &PolicyValue{SchemaName: schemaName, DisplayName: displayName, Category: category, Fields: s.Fields}, nil
+		}
+	}
+	return &PolicyValue{SchemaName: schemaName, DisplayName: displayName, Category: category}, nil
+}
+
 // mockSearchPolicySchemas is the plain (no simulated latency, no error)
 // filter both SearchPolicySchemas and ListPolicies use - ListPolicies calls
 // it directly per curatedCategories entry rather than through
@@ -566,6 +803,9 @@ func (m *mockGoogleClient) ListAdminRoles() ([]*AdminRoleAssignment, error) {
 
 func (m *mockGoogleClient) GetDeviceTelemetry(deviceID string) (*DeviceTelemetry, error) {
 	shutdown := time.Now().Add(-18 * time.Hour)
+	updateCheck := time.Now().Add(-3 * time.Hour)
+	lastUpdate := time.Now().Add(-96 * time.Hour)
+	lastReboot := time.Now().Add(-18 * time.Hour)
 	return &DeviceTelemetry{
 		StorageAvailableBytes:       44_150_000_000,
 		StorageTotalBytes:           64_000_000_000,
@@ -592,6 +832,63 @@ func (m *mockGoogleClient) GetDeviceTelemetry(deviceID string) (*DeviceTelemetry
 			{AppId: "chrome://os-settings/", AppType: "APPLICATION_TYPE_WEB", RunningDurationSeconds: 1140},
 			{AppId: "Gmail", AppType: "APPLICATION_TYPE_WEB", RunningDurationSeconds: 15},
 		},
+
+		CpuModel:               "Intel(R) Celeron(R) N4020 CPU @ 1.10GHz",
+		CpuArchitecture:        "X64",
+		CpuMaxClockKhz:         2_800_000,
+		CpuKeylockerSupported:  false,
+		CpuKeylockerConfigured: false,
+		CpuUtilizationPct:      1,
+		CpuSampleFrequency:     "811410",
+		CpuTemperatures: []CpuCoreTemp{
+			{Label: "Core 0", TemperatureCelsius: 34},
+			{Label: "Core 1", TemperatureCelsius: 34},
+			{Label: "Package id 0", TemperatureCelsius: 34},
+		},
+
+		BatteryManufacturer:     "",
+		BatterySerialNumber:     "",
+		BatteryTechnology:       "",
+		BatteryDesignMinVoltage: 0,
+		BatteryDesignCapacity:   0,
+		BatteryManufactureDate:  "",
+		BatteryFullChargeCap:    0,
+		BatteryStatus:           "",
+		BatteryChargePct:        0,
+		BatteryDischargeRateMw:  0,
+		BatteryCurrentMa:        0,
+		BatteryVoltageMv:        0,
+		BatteryTempCelsius:      0,
+
+		TouchscreenDevices: []string{"GTCH7503:00 2A94:A800"},
+
+		AudioInputMute:  false,
+		AudioOutputMute: true,
+		AudioInputGain:  50,
+
+		NetworkGuid:            "f6cb97d8-abd3-4876-b2e3-bf9dec7846f3",
+		NetworkSignalStrength:  -55,
+		NetworkWifiLinkQuality: 53,
+		NetworkTxBitrateMbps:   390,
+		NetworkRxBitrateMbps:   526,
+		NetworkTxPowerDbm:      30,
+		NetworkEncryptionOn:    false,
+		NetworkWifiPowerMgmt:   false,
+
+		OsUpdateCheckTime: &updateCheck,
+		OsLastUpdateTime:  &lastUpdate,
+		OsLastRebootTime:  &lastReboot,
+
+		DiskModel:        "eMMC",
+		DiskSerialNumber: "4235266628",
+		DiskType:         "eMMC",
+		DiskVolumeId:     "",
+
+		MemoryPageFaults:          12_117_031,
+		MemoryEncryptionState:     "MEMORY_ENCRYPTION_STATE_DISABLED",
+		MemoryEncryptionAlgorithm: "",
+		MemoryEncryptionKeyLength: 0,
+		MemoryEncryptionMaxKeys:   0,
 	}, nil
 }
 
@@ -765,6 +1062,8 @@ func mockDeviceList() []*Device {
 			RecentUserCount:         n.recentUserCount,
 			CpuTempCelsius:          n.cpuTempC,
 			TpmFamily:               n.tpmFamily,
+			TpmFirmwareVersion:      "6.44",
+			PlatformVersion:         "16733.54.0",
 			Location:                n.location,
 			Notes:                   n.notes,
 			OrderNumber:             n.orderNumber,
@@ -982,6 +1281,33 @@ func (g *realGoogleClient) ListDevices() ([]*Device, error) {
 
 	out := make([]*Device, 0, len(resp.Chromeosdevices))
 	for _, d := range resp.Chromeosdevices {
+		out = append(out, g.deviceFromAdmin(d))
+	}
+	return out, nil
+}
+
+// GetDevice fetches one device via Chromeosdevices.Get instead of waiting
+// for the next fleet-wide List-based sync - a live, this-device-only read
+// used by the Devices table's per-row "Refresh from Google" action. Reuses
+// the exact same field mapping ListDevices does (deviceFromAdmin) so a
+// single-device refresh can never disagree with what a full sync would have
+// produced for the same device. Narrows only the portal's OWN contribution
+// to staleness (the wait for the next scheduled sync) - it can't make
+// Google's own device-to-cloud check-in happen any sooner, since that
+// cadence is controlled by the device/Chrome policy, not by this call.
+func (g *realGoogleClient) GetDevice(deviceID string) (*Device, error) {
+	d, err := g.svc.Chromeosdevices.Get(g.customerID, deviceID).Do()
+	if err != nil {
+		return nil, fmt.Errorf("getting chromeos device: %w", shortenGoogleError(err))
+	}
+	return g.deviceFromAdmin(d), nil
+}
+
+// deviceFromAdmin maps one Directory API ChromeOsDevice into our Device
+// shape - shared by ListDevices (bulk) and GetDevice (single, on-demand) so
+// the two never drift out of sync with each other.
+func (g *realGoogleClient) deviceFromAdmin(d *admin.ChromeOsDevice) *Device {
+	{
 		status := "offline"
 		if d.Status == "ACTIVE" {
 			status = "active"
@@ -1097,9 +1423,10 @@ func (g *realGoogleClient) ListDevices() ([]*Device, error) {
 			}
 		}
 
-		var tpmFamily string
+		var tpmFamily, tpmFirmwareVersion string
 		if d.TpmVersionInfo != nil {
 			tpmFamily = decodeTpmFamily(d.TpmVersionInfo.Family)
+			tpmFirmwareVersion = d.TpmVersionInfo.FirmwareVersion
 		}
 
 		var cpuModel, cpuArch string
@@ -1128,7 +1455,7 @@ func (g *realGoogleClient) ListDevices() ([]*Device, error) {
 			}
 		}
 
-		out = append(out, &Device{
+		return &Device{
 			ID:                      d.DeviceId,
 			Name:                    name,
 			User:                    user,
@@ -1155,6 +1482,8 @@ func (g *realGoogleClient) ListDevices() ([]*Device, error) {
 			RecentUserCount:         len(d.RecentUsers),
 			CpuTempCelsius:          cpuTempC,
 			TpmFamily:               tpmFamily,
+			TpmFirmwareVersion:      tpmFirmwareVersion,
+			PlatformVersion:         d.PlatformVersion,
 			DeprovisionReason:       d.DeprovisionReason,
 			Location:                d.AnnotatedLocation,
 			Notes:                   d.Notes,
@@ -1171,9 +1500,8 @@ func (g *realGoogleClient) ListDevices() ([]*Device, error) {
 			FirstEnrollmentTime:     firstEnrolled,
 			LastEnrollmentTime:      lastEnrolled,
 			ConnectionState:         connectionState,
-		})
+		}
 	}
-	return out, nil
 }
 
 // ListChurn fetches deprovisioned/retired devices - same endpoint and scope
@@ -1375,15 +1703,30 @@ func (g *realGoogleClient) SubmitAlertFeedback(alertID, feedbackType string) err
 var curatedPolicySchemas = []struct {
 	schema      string
 	displayName string
+	category    string
 }{
-	{"chrome.users.SafeBrowsingProtectionLevel", "Safe Browsing protection level"},
-	{"chrome.devices.GuestMode", "Guest mode enabled"},
-	{"chrome.users.DeveloperTools", "Developer tools availability"},
-	{"chrome.users.LockScreen", "Screen lock"},
-	{"chrome.devices.DevicePowerwashAllowed", "Device powerwash allowed"},
-	{"chrome.devices.ForcedReenrollment", "Forced re-enrollment mode"},
-	{"chrome.users.UrlBlocking", "Blocked URLs"},
+	{"chrome.users.SafeBrowsingProtectionLevel", "Safe Browsing protection level", "Security"},
+	{"chrome.devices.GuestMode", "Guest mode enabled", "Security"},
+	{"chrome.users.DeveloperTools", "Developer tools availability", "Security"},
+	{"chrome.users.LockScreen", "Screen lock", "Security"},
+	{"chrome.devices.DevicePowerwashAllowed", "Device powerwash allowed", "Security"},
+	{"chrome.devices.ForcedReenrollment", "Forced re-enrollment mode", "Security"},
+	{"chrome.users.UrlBlocking", "Blocked URLs", "Security"},
 }
+
+// The app-install schemas (Extensions/PWA deployments/App deployments) are
+// deliberately NOT listed here by a hardcoded exact name - confirmed live
+// that "chrome.users.apps.WebAppInstallForceList" 404s ("Requested entity
+// was not found"), i.e. that exact resource path doesn't exist on Google's
+// side despite being a plausible-looking guess (it was carried over from
+// this codebase's own illustrative mock catalog, which was never claimed to
+// be a verified real schema name). Since every entry in curatedPolicySchemas
+// is resolved directly and any resolve failure is FATAL to the whole tab,
+// one wrong guess here broke Policy compliance entirely. These three stay in
+// curatedCategories below instead, which finds the real schema by keyword
+// search (self-correcting to whatever the real name actually is on this
+// customer's catalog) and treats a lookup failure as "skip this one", not
+// fatal to everything else.
 
 // curatedCategories are settings areas requested for the Policy compliance
 // tab beyond the original security-focused curatedPolicySchemas list above.
@@ -1399,19 +1742,31 @@ var curatedPolicySchemas = []struct {
 var curatedCategories = []struct {
 	keyword     string
 	displayName string
+	// preferredField, when set, means the keyword's first search hit isn't
+	// trustworthy enough to use as-is - confirmed live that on a real
+	// domain, "extension" alone matches many schemas (e.g.
+	// DeviceLoginScreenExtensionManifestVTwoAvailability came back before
+	// the actual force-install one), so matches[0] silently picked the
+	// wrong schema. When set, searchCategorySchema below fetches more
+	// results and picks whichever one actually has a field with this exact
+	// name, falling back to matches[0] only if none do - so this still
+	// self-corrects to whatever schema truly has that field on this
+	// customer's catalog, it just doesn't stop looking at the first
+	// coincidental keyword hit.
+	preferredField string
 }{
-	{"bookmark", "Bookmarks"},
-	{"power", "Power button options"},
-	{"camera", "Camera"},
-	{"microphone", "Microphone"},
-	{"usb", "USB"},
-	{"wallpaper", "Wallpaper"},
-	{"time", "Time-based policies"},
-	{"deployment", "App deployments"},
-	{"kiosk", "Kiosk mode"},
-	{"extension", "Extensions"},
-	{"webapp", "PWA deployments"},
-	{"app control", "App control"},
+	{keyword: "bookmark", displayName: "Bookmarks"},
+	{keyword: "power", displayName: "Power button options"},
+	{keyword: "camera", displayName: "Camera"},
+	{keyword: "microphone", displayName: "Microphone"},
+	{keyword: "usb", displayName: "USB"},
+	{keyword: "wallpaper", displayName: "Wallpaper"},
+	{keyword: "time", displayName: "Time-based policies"},
+	{keyword: "deployment", displayName: "App deployments", preferredField: "arcPolicy"},
+	{keyword: "kiosk", displayName: "Kiosk mode"},
+	{keyword: "extension", displayName: "Extensions", preferredField: "extensionInstallForcelist"},
+	{keyword: "webapp", displayName: "PWA deployments", preferredField: "webAppInstallForceList"},
+	{keyword: "app control", displayName: "App control"},
 }
 
 // Resolve only returns a schema if it has an explicitly configured value
@@ -1478,12 +1833,30 @@ func (g *realGoogleClient) ListPolicies() ([]*PolicyValue, error) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			value, err := g.resolveSchemaValue(customer, targetID, schema.schema)
+			var value string
+			err := retryTransientGoogleErr(func() error {
+				var rerr error
+				value, rerr = g.resolveSchemaValue(customer, targetID, schema.schema)
+				return rerr
+			})
 			if err != nil {
 				errCh <- err
 				return
 			}
-			curatedResults[i] = &PolicyValue{SchemaName: schema.schema, DisplayName: schema.displayName, Category: "Security", Value: value}
+			// Field metadata is best-effort: a schema that resolves fine but
+			// whose Get() call fails for some reason still shows its value,
+			// just without the friendly per-field form (falls back to raw
+			// JSON in the UI) - not worth failing the whole tab over.
+			var fields []PolicySchemaField
+			ferr := retryTransientGoogleErr(func() error {
+				var rerr error
+				fields, rerr = g.getPolicySchemaFields(schema.schema)
+				return rerr
+			})
+			if ferr != nil {
+				log.Printf("policy schema fields for %s (non-fatal): %v", schema.schema, ferr)
+			}
+			curatedResults[i] = &PolicyValue{SchemaName: schema.schema, DisplayName: schema.displayName, Category: schema.category, Value: value, Fields: fields}
 		}()
 	}
 
@@ -1494,21 +1867,61 @@ func (g *realGoogleClient) ListPolicies() ([]*PolicyValue, error) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			matches, err := g.searchPolicySchemasPaged(cat.keyword, 1)
+			// A category lookup failing (including a transient error straight
+			// from Google's own infrastructure, e.g. a bare 502 with no JSON
+			// body - confirmed live) is logged and skipped rather than sent
+			// to errCh: with ~19 concurrent Google API calls on every load of
+			// this tab, treating any single one as fatal for the whole tab
+			// means one flaky call blanks everything else that DID succeed.
+			// The fixed curated-security-schema list below is held to a
+			// stricter standard (still fatal) since those 7 are the specific
+			// set this tab promises to always show.
+			// preferredField categories search a wider result set (a bare
+			// keyword like "extension" matches many schemas on a real
+			// domain, and the very first hit isn't reliably the one we
+			// want - confirmed live) and pick whichever match actually
+			// carries that field; everything else keeps the original
+			// cheap limit=1/first-match behavior.
+			searchLimit := 1
+			if cat.preferredField != "" {
+				searchLimit = 20
+			}
+			var matches []*PolicySchemaInfo
+			err := retryTransientGoogleErr(func() error {
+				var rerr error
+				matches, rerr = g.searchPolicySchemasPaged(cat.keyword, searchLimit)
+				return rerr
+			})
 			if err != nil {
-				errCh <- fmt.Errorf("finding a schema for %s: %w", cat.displayName, err)
+				log.Printf("policy category %s (non-fatal, skipped this load): %v", cat.displayName, err)
 				return
 			}
 			if len(matches) == 0 {
 				return // no real schema found for this keyword on this customer - nothing to show, not a fetch failure
 			}
 			match := matches[0]
-			value, err := g.resolveSchemaValue(customer, targetID, match.SchemaName)
+			if cat.preferredField != "" {
+			matchLoop:
+				for _, m := range matches {
+					for _, f := range m.Fields {
+						if f.Name == cat.preferredField {
+							match = m
+							break matchLoop
+						}
+					}
+				}
+			}
+			var value string
+			err = retryTransientGoogleErr(func() error {
+				var rerr error
+				value, rerr = g.resolveSchemaValue(customer, targetID, match.SchemaName)
+				return rerr
+			})
 			if err != nil {
-				errCh <- err
+				log.Printf("policy category %s (non-fatal, skipped this load): %v", cat.displayName, err)
 				return
 			}
-			categoryResults[i] = &PolicyValue{SchemaName: match.SchemaName, DisplayName: shortSchemaName(match.SchemaName), Category: cat.displayName, Value: value}
+			categoryResults[i] = &PolicyValue{SchemaName: match.SchemaName, DisplayName: shortSchemaName(match.SchemaName), Category: cat.displayName, Value: value, Fields: match.Fields}
 		}()
 	}
 
@@ -1589,8 +2002,10 @@ func policyUpdateMask(valueJSON json.RawMessage) (string, error) {
 // SetPolicy enforces a new value on orgUnitPath via the Chrome Policy API's
 // write scope (chrome.management.policy) - BatchModify takes effect on
 // devices/users in that OU the same as an Admin console policy edit, next
-// check-in.
-func (g *realGoogleClient) SetPolicy(orgUnitPath, schemaName string, valueJSON json.RawMessage) error {
+// check-in. When appID is set (required for per-app schemas like
+// chrome.users.apps.InstallType), it's carried in additionalTargetKeys.app_id
+// per Google's documented app-policy request shape - not in the value body.
+func (g *realGoogleClient) SetPolicy(orgUnitPath, schemaName string, valueJSON json.RawMessage, appID string) error {
 	updateMask, err := policyUpdateMask(valueJSON)
 	if err != nil {
 		return err
@@ -1601,13 +2016,18 @@ func (g *realGoogleClient) SetPolicy(orgUnitPath, schemaName string, valueJSON j
 		return err
 	}
 
+	targetKey := &chromepolicy.GoogleChromePolicyVersionsV1PolicyTargetKey{
+		TargetResource: "orgunits/" + targetID,
+	}
+	if appID != "" {
+		targetKey.AdditionalTargetKeys = map[string]string{"app_id": appID}
+	}
+
 	customer := "customers/" + g.customerID
 	req := &chromepolicy.GoogleChromePolicyVersionsV1BatchModifyOrgUnitPoliciesRequest{
 		Requests: []*chromepolicy.GoogleChromePolicyVersionsV1ModifyOrgUnitPolicyRequest{
 			{
-				PolicyTargetKey: &chromepolicy.GoogleChromePolicyVersionsV1PolicyTargetKey{
-					TargetResource: "orgunits/" + targetID,
-				},
+				PolicyTargetKey: targetKey,
 				PolicyValue: &chromepolicy.GoogleChromePolicyVersionsV1PolicyValue{
 					PolicySchema: schemaName,
 					Value:        googleapi.RawMessage(valueJSON),
@@ -1651,6 +2071,59 @@ func (g *realGoogleClient) ClearPolicy(orgUnitPath, schemaName string) error {
 // maxPolicySchemaResults caps how many matches SearchPolicySchemas returns -
 // Google's full catalog runs into the hundreds, and this is a live keyword
 // search meant to help an admin find one real schema, not a bulk export.
+// policySchemaFieldFromDescription converts one of Google's own
+// FieldDescriptions entries into our PolicySchemaField shape - shared by
+// searchPolicySchemasPaged and getPolicySchemaFields so both paths (schema
+// search, and a direct exact-name Get) describe a field identically.
+func policySchemaFieldFromDescription(fd *chromepolicy.GoogleChromePolicyVersionsV1PolicySchemaFieldDescription, def *chromepolicy.Proto2FileDescriptorProto) PolicySchemaField {
+	field := PolicySchemaField{
+		Name: fd.Field, Description: fd.FieldDescription, DefaultValue: fd.DefaultValue,
+		HasNestedFields: len(fd.NestedFieldDescriptions) > 0, IsRepeated: protoFieldIsRepeated(def, fd.Field),
+	}
+	for _, kv := range fd.KnownValueDescriptions {
+		field.KnownValues = append(field.KnownValues, kv.Value)
+	}
+	return field
+}
+
+// protoFieldIsRepeated looks up one field's cardinality in the schema's own
+// proto descriptor (Definition) - LABEL_REPEATED is a genuine signal that a
+// field is an array, straight from Google's schema, not inferred from a
+// sample value (which doesn't exist for a field that's never been set).
+func protoFieldIsRepeated(def *chromepolicy.Proto2FileDescriptorProto, fieldName string) bool {
+	if def == nil {
+		return false
+	}
+	for _, mt := range def.MessageType {
+		for _, f := range mt.Field {
+			if f.JsonName == fieldName || f.Name == fieldName {
+				return f.Label == "LABEL_REPEATED"
+			}
+		}
+	}
+	return false
+}
+
+// getPolicySchemaFields fetches one schema's field metadata by its exact
+// name (Customers.PolicySchemas.Get) - used for the curated schema list in
+// ListPolicies, which (unlike the keyword-searched categories) never goes
+// through SearchPolicySchemas and so never picks up field metadata for
+// free. Lets Policy compliance render real per-field controls (dropdowns
+// for enums, toggles for booleans) instead of a raw JSON box, for the
+// curated schemas too.
+func (g *realGoogleClient) getPolicySchemaFields(schemaName string) ([]PolicySchemaField, error) {
+	name := fmt.Sprintf("customers/%s/policySchemas/%s", g.customerID, schemaName)
+	resp, err := g.cp.Customers.PolicySchemas.Get(name).Do()
+	if err != nil {
+		return nil, fmt.Errorf("fetching schema %s: %w", schemaName, shortenGoogleError(err))
+	}
+	var fields []PolicySchemaField
+	for _, fd := range resp.FieldDescriptions {
+		fields = append(fields, policySchemaFieldFromDescription(fd, resp.Definition))
+	}
+	return fields, nil
+}
+
 const maxPolicySchemaResults = 25
 
 // SearchPolicySchemas pages through the Chrome Policy API's real schema
@@ -1662,6 +2135,28 @@ const maxPolicySchemaResults = 25
 // expression that silently returns nothing on a live domain.
 func (g *realGoogleClient) SearchPolicySchemas(query string) ([]*PolicySchemaInfo, error) {
 	return g.searchPolicySchemasPaged(query, maxPolicySchemaResults)
+}
+
+// ResolvePolicySchema resolves one caller-chosen schema (from a Browse
+// policies search result) against the root org unit - reuses the exact
+// same resolveSchemaValue helper ListPolicies calls for its curated set,
+// just for a single schema picked at request time instead of the fixed
+// list.
+func (g *realGoogleClient) ResolvePolicySchema(schemaName, displayName, category string) (*PolicyValue, error) {
+	targetID, err := g.resolveOrgUnitID("/")
+	if err != nil {
+		return nil, err
+	}
+	customer := "customers/" + g.customerID
+	value, err := g.resolveSchemaValue(customer, targetID, schemaName)
+	if err != nil {
+		return nil, err
+	}
+	fields, ferr := g.getPolicySchemaFields(schemaName)
+	if ferr != nil {
+		log.Printf("policy schema fields for %s (non-fatal): %v", schemaName, ferr)
+	}
+	return &PolicyValue{SchemaName: schemaName, DisplayName: displayName, Category: category, Value: value, Fields: fields}, nil
 }
 
 // searchPolicySchemasPaged is the shared paginated-search implementation -
@@ -1697,11 +2192,7 @@ func (g *realGoogleClient) searchPolicySchemasPaged(query string, limit int) ([]
 			}
 			info := &PolicySchemaInfo{SchemaName: s.SchemaName, Description: s.PolicyDescription, Category: s.CategoryTitle}
 			for _, fd := range s.FieldDescriptions {
-				field := PolicySchemaField{Name: fd.Field, Description: fd.FieldDescription}
-				for _, kv := range fd.KnownValueDescriptions {
-					field.KnownValues = append(field.KnownValues, kv.Value)
-				}
-				info.Fields = append(info.Fields, field)
+				info.Fields = append(info.Fields, policySchemaFieldFromDescription(fd, s.Definition))
 			}
 			out = append(out, info)
 			if len(out) >= limit {
@@ -1796,10 +2287,12 @@ func (g *realGoogleClient) GetDeviceTelemetry(deviceID string) (*DeviceTelemetry
 	// not just a couple, so adding a new mapped field later doesn't also
 	// require remembering to widen this mask.
 	readMask := strings.Join([]string{
-		"storage_info", "boot_performance_report", "network_status_report",
-		"network_diagnostics_report", "battery_status_report", "memory_info",
-		"memory_status_report", "graphics_info", "audio_status_report",
-		"peripherals_report", "app_report",
+		"storage_info", "storage_status_report", "boot_performance_report",
+		"network_status_report", "network_diagnostics_report",
+		"battery_status_report", "memory_info", "memory_status_report",
+		"graphics_info", "audio_status_report", "peripherals_report",
+		"app_report", "cpu_info", "cpu_status_report", "battery_info",
+		"os_update_status",
 	}, ",")
 	resp, err := g.telemetry.Customers.Telemetry.Devices.Get(name).ReadMask(readMask).Do()
 	if err != nil {
@@ -1811,6 +2304,16 @@ func (g *realGoogleClient) GetDeviceTelemetry(deviceID string) (*DeviceTelemetry
 	if resp.StorageInfo != nil {
 		out.StorageAvailableBytes = resp.StorageInfo.AvailableDiskBytes
 		out.StorageTotalBytes = resp.StorageInfo.TotalDiskBytes
+		if len(resp.StorageInfo.Volume) > 0 {
+			out.DiskVolumeId = resp.StorageInfo.Volume[0].VolumeId
+		}
+	}
+
+	if len(resp.StorageStatusReport) > 0 && len(resp.StorageStatusReport[0].Disk) > 0 {
+		disk := resp.StorageStatusReport[0].Disk[0]
+		out.DiskModel = disk.Model
+		out.DiskSerialNumber = disk.SerialNumber
+		out.DiskType = disk.Type
 	}
 
 	if len(resp.BootPerformanceReport) > 0 {
@@ -1835,6 +2338,14 @@ func (g *realGoogleClient) GetDeviceTelemetry(deviceID string) (*DeviceTelemetry
 		out.ConnectionType = ns.ConnectionType
 		out.LanIpAddress = ns.LanIpAddress
 		out.GatewayIpAddress = ns.GatewayIpAddress
+		out.NetworkGuid = ns.Guid
+		out.NetworkSignalStrength = ns.SignalStrengthDbm
+		out.NetworkWifiLinkQuality = ns.WifiLinkQuality
+		out.NetworkTxBitrateMbps = ns.TransmissionBitRateMbps
+		out.NetworkRxBitrateMbps = ns.ReceivingBitRateMbps
+		out.NetworkTxPowerDbm = ns.TransmissionPowerDbm
+		out.NetworkEncryptionOn = ns.EncryptionOn
+		out.NetworkWifiPowerMgmt = ns.WifiPowerManagementEnabled
 	}
 
 	if len(resp.NetworkDiagnosticsReport) > 0 && resp.NetworkDiagnosticsReport[0].HttpsLatencyData != nil {
@@ -1845,15 +2356,119 @@ func (g *realGoogleClient) GetDeviceTelemetry(deviceID string) (*DeviceTelemetry
 		}
 	}
 
-	if len(resp.BatteryStatusReport) > 0 {
-		bs := resp.BatteryStatusReport[0]
-		out.BatteryHealth = bs.BatteryHealth
-		out.BatteryCycleCount = bs.CycleCount
+	// BatteryStatusReport is a list of periodic report snapshots, not one
+	// report - confirmed live against a real device the same way AppReport
+	// above was: resp.BatteryStatusReport[0] can be a snapshot whose Sample
+	// array is empty (that particular upload window just didn't carry a
+	// fresh reading) even while an older or newer snapshot in the same
+	// response has real charge/voltage/current/temperature data, or vice
+	// versa for the outer health/cycle-count/full-charge-capacity fields.
+	// Reading only index 0 silently dropped whichever of those two field
+	// groups wasn't populated in that specific snapshot. Walk every
+	// snapshot and every sample, keeping whichever is newest by its own
+	// ReportTime, instead of assuming index 0 is both present and current.
+	var newestReportTime, newestSampleTime time.Time
+	for _, bs := range resp.BatteryStatusReport {
+		if bs.BatteryHealth == "" && bs.CycleCount == 0 && bs.FullChargeCapacity == 0 {
+			continue
+		}
+		rt, _ := time.Parse(time.RFC3339, bs.ReportTime)
+		if out.BatteryHealth == "" || rt.After(newestReportTime) {
+			out.BatteryHealth = bs.BatteryHealth
+			out.BatteryCycleCount = bs.CycleCount
+			out.BatteryFullChargeCap = bs.FullChargeCapacity
+			newestReportTime = rt
+		}
+		for _, sm := range bs.Sample {
+			st, _ := time.Parse(time.RFC3339, sm.ReportTime)
+			if out.BatteryStatus == "" || st.After(newestSampleTime) {
+				out.BatteryStatus = sm.Status
+				out.BatteryChargePct = sm.ChargeRate
+				out.BatteryDischargeRateMw = sm.DischargeRate
+				out.BatteryCurrentMa = sm.Current
+				out.BatteryVoltageMv = sm.Voltage
+				out.BatteryTempCelsius = sm.Temperature
+				newestSampleTime = st
+			}
+		}
+	}
+
+	// BatteryInfo has no per-entry timestamp (it's hardware identity, not a
+	// timestamped sample) - still guarded against index 0 being a blank
+	// entry ahead of a populated one, on the same "don't trust position"
+	// principle as above.
+	for _, bi := range resp.BatteryInfo {
+		if bi.Manufacturer == "" && bi.SerialNumber == "" {
+			continue
+		}
+		out.BatteryManufacturer = bi.Manufacturer
+		out.BatterySerialNumber = bi.SerialNumber
+		out.BatteryTechnology = bi.Technology
+		out.BatteryDesignMinVoltage = bi.DesignMinVoltage
+		out.BatteryDesignCapacity = bi.DesignCapacity
+		if bi.ManufactureDate != nil && bi.ManufactureDate.Year > 0 {
+			out.BatteryManufactureDate = fmt.Sprintf("%04d-%02d-%02d", bi.ManufactureDate.Year, bi.ManufactureDate.Month, bi.ManufactureDate.Day)
+		}
+		break
+	}
+
+	// Google's own BatteryHealth field is a coarse 3-bucket enum (Normal /
+	// Replace soon / Replace now), not the percentage Admin console's own
+	// Hardware tab actually displays - confirmed via the enum's own doc
+	// comment that Admin console's percentage is computed as full charge
+	// capacity / design capacity, so it's replicated here the same way
+	// whenever both real numbers are available, instead of only exposing
+	// the coarser enum.
+	if out.BatteryFullChargeCap > 0 && out.BatteryDesignCapacity > 0 {
+		out.BatteryHealthPct = int64(float64(out.BatteryFullChargeCap) / float64(out.BatteryDesignCapacity) * 100)
+	}
+
+	if len(resp.CpuInfo) > 0 {
+		ci := resp.CpuInfo[0]
+		out.CpuModel = ci.Model
+		out.CpuArchitecture = ci.Architecture
+		out.CpuMaxClockKhz = ci.MaxClockSpeed
+		out.CpuKeylockerSupported = ci.KeylockerSupported
+		out.CpuKeylockerConfigured = ci.KeylockerConfigured
+	}
+
+	if len(resp.CpuStatusReport) > 0 {
+		cs := resp.CpuStatusReport[0]
+		out.CpuUtilizationPct = cs.CpuUtilizationPct
+		out.CpuSampleFrequency = cs.SampleFrequency
+		for _, t := range cs.CpuTemperatureInfo {
+			out.CpuTemperatures = append(out.CpuTemperatures, CpuCoreTemp{Label: t.Label, TemperatureCelsius: t.TemperatureCelsius})
+		}
+	}
+
+	if len(resp.OsUpdateStatus) > 0 {
+		os := resp.OsUpdateStatus[0]
+		if os.LastUpdateCheckTime != "" {
+			if t, err := time.Parse(time.RFC3339, os.LastUpdateCheckTime); err == nil {
+				out.OsUpdateCheckTime = &t
+			}
+		}
+		if os.LastUpdateTime != "" {
+			if t, err := time.Parse(time.RFC3339, os.LastUpdateTime); err == nil {
+				out.OsLastUpdateTime = &t
+			}
+		}
+		if os.LastRebootTime != "" {
+			if t, err := time.Parse(time.RFC3339, os.LastRebootTime); err == nil {
+				out.OsLastRebootTime = &t
+			}
+		}
 	}
 
 	if resp.MemoryInfo != nil {
 		out.MemoryAvailableBytes = resp.MemoryInfo.AvailableRamBytes
 		out.MemoryTotalBytes = resp.MemoryInfo.TotalRamBytes
+		if enc := resp.MemoryInfo.TotalMemoryEncryption; enc != nil {
+			out.MemoryEncryptionState = enc.EncryptionState
+			out.MemoryEncryptionAlgorithm = enc.EncryptionAlgorithm
+			out.MemoryEncryptionKeyLength = enc.KeyLength
+			out.MemoryEncryptionMaxKeys = enc.MaxKeys
+		}
 	}
 	// MemoryInfo.AvailableRamBytes comes and goes between polls (confirmed
 	// live - Google's own docs flag the equivalent status-report field as
@@ -1863,10 +2478,18 @@ func (g *realGoogleClient) GetDeviceTelemetry(deviceID string) (*DeviceTelemetry
 	if out.MemoryAvailableBytes == 0 && len(resp.MemoryStatusReport) > 0 {
 		out.MemoryAvailableBytes = resp.MemoryStatusReport[0].SystemRamFreeBytes
 	}
+	if len(resp.MemoryStatusReport) > 0 {
+		out.MemoryPageFaults = resp.MemoryStatusReport[0].PageFaults
+	}
 
 	if resp.GraphicsInfo != nil {
 		for _, dd := range resp.GraphicsInfo.DisplayDevices {
 			out.Displays = append(out.Displays, DisplayInfo{Name: dd.DisplayName, Internal: dd.Internal})
+		}
+		if resp.GraphicsInfo.TouchScreenInfo != nil {
+			for _, ts := range resp.GraphicsInfo.TouchScreenInfo.Devices {
+				out.TouchscreenDevices = append(out.TouchscreenDevices, ts.DisplayName)
+			}
 		}
 	}
 
@@ -1875,6 +2498,9 @@ func (g *realGoogleClient) GetDeviceTelemetry(deviceID string) (*DeviceTelemetry
 		out.AudioInputDevice = ar.InputDevice
 		out.AudioOutputDevice = ar.OutputDevice
 		out.AudioOutputVolume = ar.OutputVolume
+		out.AudioInputMute = ar.InputMute
+		out.AudioOutputMute = ar.OutputMute
+		out.AudioInputGain = ar.InputGain
 	}
 
 	if len(resp.PeripheralsReport) > 0 {
@@ -1927,10 +2553,9 @@ func (g *realGoogleClient) GetDeviceTelemetry(deviceID string) (*DeviceTelemetry
 		sort.Slice(out.AppsUsage, func(i, j int) bool {
 			return out.AppsUsage[i].RunningDurationSeconds > out.AppsUsage[j].RunningDurationSeconds
 		})
-		const maxAppsShown = 15
-		if len(out.AppsUsage) > maxAppsShown {
-			out.AppsUsage = out.AppsUsage[:maxAppsShown]
-		}
+		// No cap here - the frontend paginates the full list (matching Admin
+		// console's own "Rows per page" behavior), so truncating server-side
+		// would just silently hide real usage data instead of paginating it.
 	}
 
 	return out, nil
@@ -2162,14 +2787,14 @@ func (g *realGoogleClient) ListOrgUnits() ([]*OrgUnitInfo, error) {
 // return a real (not fabricated) error on an ordinary user-session device -
 // confirmed live rather than assumed.
 var commandActions = map[string]string{
-	"restart":         "REBOOT",
-	"wipe":             "WIPE_USERS",
-	"powerwash":        "REMOTE_POWERWASH",
-	"screenshot":       "TAKE_A_SCREENSHOT",
-	"set_volume":       "SET_VOLUME",
-	"crd":              "DEVICE_START_CRD_SESSION",
-	"capture_logs":     "CAPTURE_LOGS",
-	"support_packet":   "FETCH_SUPPORT_PACKET",
+	"restart":        "REBOOT",
+	"wipe":           "WIPE_USERS",
+	"powerwash":      "REMOTE_POWERWASH",
+	"screenshot":     "TAKE_A_SCREENSHOT",
+	"set_volume":     "SET_VOLUME",
+	"crd":            "DEVICE_START_CRD_SESSION",
+	"capture_logs":   "CAPTURE_LOGS",
+	"support_packet": "FETCH_SUPPORT_PACKET",
 }
 
 // batchStatusActions maps our action names to the modern
@@ -2237,14 +2862,49 @@ func (g *realGoogleClient) DoAction(deviceID, action, payload string) (string, e
 		if payload == "" {
 			return "", fmt.Errorf("move requires a target org unit path")
 		}
-		_, err := g.svc.Chromeosdevices.Patch(g.customerID, deviceID, &admin.ChromeOsDevice{OrgUnitPath: payload}).Do()
-		if err != nil {
+		// Chromeosdevices.MoveDevicesToOu, not a plain Patch(OrgUnitPath:...) -
+		// confirmed live that Patch can 400 with "Inconsistent Orgunit id and
+		// path in request", giving back a real org unit ID number even though
+		// this request only ever sends a path (OrgUnitId is left unset, and
+		// its omitempty json tag means it's never actually in our outgoing
+		// body - the mismatch is on Google's own resolution side, not
+		// anything this connector sent). MoveDevicesToOu is Google's actual
+		// purpose-built endpoint for this - takes a bare path, no ID
+		// resolution required - and is already what BatchMoveDevices below
+		// uses successfully for multi-device moves; this just calls the same
+		// endpoint with a one-device list instead of falling back to the
+		// generic (and apparently flaky) Patch path.
+		req := &admin.ChromeOsMoveDevicesToOu{DeviceIds: []string{deviceID}}
+		if err := g.svc.Chromeosdevices.MoveDevicesToOu(g.customerID, payload, req).Do(); err != nil {
 			return "", fmt.Errorf("moving device: %w", shortenGoogleError(err))
 		}
 		return "", nil
 	}
 
 	return "", fmt.Errorf("unsupported action: %s", action)
+}
+
+// UpdateAssetInfo writes annotatedLocation/notes/orderNumber the same way
+// DoAction's "move" case writes orgUnitPath - a plain Chromeosdevices.Patch,
+// just against different fields. Kept as its own method (not folded into
+// DoAction's action-string dispatch) since it takes three fields at once
+// instead of a single payload string, and isn't a state-changing "action"
+// in the DeviceAction/action-log sense - see handleAssetInfoUpdate.
+func (g *realGoogleClient) UpdateAssetInfo(deviceID, location, notes, orderNumber string) error {
+	_, err := g.svc.Chromeosdevices.Patch(g.customerID, deviceID, &admin.ChromeOsDevice{
+		AnnotatedLocation: location,
+		Notes:             notes,
+		OrderNumber:       orderNumber,
+		// The generated client's json tags are all `omitempty`, so an empty
+		// string here (clearing a field) would otherwise be dropped from the
+		// PATCH body entirely and silently leave the old value in place on
+		// Google's side. ForceSendFields makes empty values go out too.
+		ForceSendFields: []string{"AnnotatedLocation", "Notes", "OrderNumber"},
+	}).Do()
+	if err != nil {
+		return fmt.Errorf("updating asset info: %w", shortenGoogleError(err))
+	}
+	return nil
 }
 
 // BatchMoveDevices moves many devices to the same org unit in one API call
@@ -2279,7 +2939,7 @@ var defaultTelemetryEventTypes = []string{
 // snapshots: this is the actual event stream Google pushes as things
 // happen on the device (network changes, USB, app installs, audio/WiFi
 // issues), not a periodic poll result.
-func (g *realGoogleClient) ListDeviceEvents(eventTypes []string, since time.Time) ([]*DeviceEvent, error) {
+func (g *realGoogleClient) ListDeviceEvents(eventTypes []string, since time.Time, deviceID string) ([]*DeviceEvent, error) {
 	if len(eventTypes) == 0 {
 		eventTypes = defaultTelemetryEventTypes
 	}
@@ -2304,7 +2964,10 @@ func (g *realGoogleClient) ListDeviceEvents(eventTypes []string, since time.Time
 	out := []*DeviceEvent{}
 	for _, eventType := range eventTypes {
 		filter := fmt.Sprintf(`timestamp > "%s" AND event_type=%s`, sinceStr, eventType)
-		resp, err := g.telemetry.Customers.Telemetry.Events.List("customers/"+g.customerID).Filter(filter).PageSize(50).ReadMask(readMask).Do()
+		if deviceID != "" {
+			filter += fmt.Sprintf(` AND device_id="%s"`, deviceID)
+		}
+		resp, err := g.telemetry.Customers.Telemetry.Events.List("customers/" + g.customerID).Filter(filter).PageSize(50).ReadMask(readMask).Do()
 		if err != nil {
 			return nil, fmt.Errorf("listing %s telemetry events: %w", eventType, shortenGoogleError(err))
 		}
@@ -2322,6 +2985,7 @@ func (g *realGoogleClient) ListDeviceEvents(eventTypes []string, since time.Time
 				ev.UserEmail = e.User.Email
 			}
 			ev.Description = describeTelemetryEvent(e)
+			ev.AppId = telemetryEventAppId(e)
 			out = append(out, ev)
 		}
 	}
@@ -2379,6 +3043,28 @@ func describeTelemetryEvent(e *chromemanagement.GoogleChromeManagementV1Telemetr
 		}
 	case "AUDIO_SEVERE_UNDERRUN":
 		return "Audio buffer underrun (severe)"
+	}
+	return ""
+}
+
+// telemetryEventAppId pulls the raw app/extension ID out of whichever
+// app-related payload is populated, mirroring describeTelemetryEvent's
+// switch - kept separate so the frontend gets the ID on its own field
+// instead of having to re-parse it back out of the description text.
+func telemetryEventAppId(e *chromemanagement.GoogleChromeManagementV1TelemetryEvent) string {
+	switch e.EventType {
+	case "APP_INSTALLED":
+		if e.AppInstallEvent != nil {
+			return e.AppInstallEvent.AppId
+		}
+	case "APP_UNINSTALLED":
+		if e.AppUninstallEvent != nil {
+			return e.AppUninstallEvent.AppId
+		}
+	case "APP_LAUNCHED":
+		if e.AppLaunchEvent != nil {
+			return e.AppLaunchEvent.AppId
+		}
 	}
 	return ""
 }

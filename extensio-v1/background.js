@@ -87,60 +87,6 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
-// chrome.idle as a second, independent wake trigger alongside the alarm
-// above - confirmed live (real device logs) that chrome.alarms, despite
-// being Chrome's documented mechanism for waking a terminated MV3 service
-// worker, doesn't reliably do so in practice: this extension saw real gaps
-// of 15-37+ minutes with ZERO activity of any kind (not just WS - the
-// completely separate ping alarm too) while the device was confirmed
-// awake, unlocked, and online the whole time. This is a known, widely-
-// reported MV3 platform limitation (Chrome's own docs call alarm timing
-// "approximate, not precise," and extension developers broadly report
-// service workers going dark for extended stretches despite alarms) - not
-// something fixable by writing "more correct" alarm code, since the
-// existing alarm registration already follows Google's own recommended
-// pattern (a real listener at the top level, not buried in a callback).
-// chrome.idle.onStateChanged is a genuinely different underlying mechanism
-// from alarms - reacting to device activity itself rather than a timer -
-// so it doesn't share the same failure mode and gives a second independent
-// chance to notice the worker needs to do something. setDetectionInterval
-// is set to Chrome's actual minimum (15s) so an idle->active transition
-// (unlocking, waking, or simply moving the mouse/typing) is noticed as
-// promptly as the platform allows, rather than the 60s default.
-chrome.idle.setDetectionInterval(15);
-chrome.idle.onStateChanged.addListener((state) => {
-  reportIdleState(state); // every transition (active/idle/locked), not just active - see idleUrlFromApiUrl below
-  if (state !== "active") return;
-  logDiag("lifecycle", "idle state changed to active - checking ping/WS status");
-  pingLocation();
-  connectDeviceWebSocket();
-});
-
-// reportIdleState sends every chrome.idle transition to the portal's
-// connectivity history (see handleIdleState on the backend) - this is the
-// ONLY way the server can ever know about idle/locked state at all, since
-// nothing server-side can observe it. Local-testing only, same reasoning as
-// the WebSocket (USE_COLLECTOR_API=true means this build talks to the real
-// Halofort collector, which doesn't have this endpoint) - fire-and-forget,
-// a failed report here should never affect the actual ping/WS flows.
-async function reportIdleState(state) {
-  if (USE_COLLECTOR_API) return;
-  try {
-    const deviceId = await resolveDeviceId("reportIdleState");
-    if (!deviceId) return;
-    const url = new URL(API_URL);
-    url.pathname = "/api/chromeos/idle-state";
-    url.search = "";
-    await fetch(url.toString(), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ deviceId, state }),
-    });
-  } catch (e) {
-    logDiag("idle_report_error", e.message);
-  }
-}
-
 // Lets the diagnostics options page (or anything else in this extension)
 // trigger an immediate ping without waiting for the next 15-minute alarm.
 // sendMessage itself wakes an idle service worker, so this works even if
@@ -451,50 +397,6 @@ async function flushQueue() {
   }
 }
 
-// resolveDeviceId is the single source of truth for "which device is this,"
-// shared by pingLocation() below and the WebSocket connection (see the
-// bottom of this file) so the two flows can never disagree about which
-// device they're reporting as. Always tries the real enterprise API first,
-// on every call, every device - never assumes it's unavailable just because
-// this build is sideloaded. Returns "" (never throws) when no ID could be
-// resolved at all, logging why via logDiag either way.
-async function resolveDeviceId(logPrefix) {
-  let deviceId = "";
-  if (chrome.enterprise && chrome.enterprise.deviceAttributes) {
-    deviceId = await new Promise((resolve) => {
-      chrome.enterprise.deviceAttributes.getDirectoryDeviceId(resolve);
-    });
-  }
-  if (deviceId) {
-    console.log(`${logPrefix}: Fetched real device ID: ${deviceId}`);
-    await logDiag("device_id_ok", deviceId);
-  } else {
-    // The enterprise API is either not exposed at all (chrome.enterprise is
-    // undefined) or resolved empty - both are the expected outcome for a
-    // sideloaded "Load unpacked" extension, since Chrome only grants
-    // enterprise.deviceAttributes to extensions force-installed by policy.
-    // A single hardcoded ID here used to get shared by every sideloaded
-    // test device at once, so each one's real ping silently overwrote the
-    // same one device's location instead of its own - confirmed live with
-    // two test devices in play simultaneously. Each device now needs its
-    // OWN id set once via this extension's own options page (see
-    // options.html's "Manual device ID override"), read back from storage
-    // here instead of one shared literal.
-    const stored = await chrome.storage.local.get("manualDeviceId");
-    deviceId = (stored.manualDeviceId || "").trim();
-    if (deviceId) {
-      console.log(`${logPrefix}: enterprise API unavailable - using this device's manually-set ID: ${deviceId}`);
-      await logDiag("device_id_fallback", `enterprise API unavailable/empty - using manually-set ID ${deviceId}`);
-    } else {
-      console.warn(`${logPrefix}: no device ID available - enterprise API unavailable and no manual ID set in options.`);
-      await logDiag("publish_dropped", "no device ID available: enterprise.deviceAttributes unavailable/empty and no manual device ID set via Extension options - set one there to identify this device");
-      return "";
-    }
-  }
-  await chrome.storage.local.set({ lastKnownDeviceId: deviceId });
-  return deviceId;
-}
-
 async function pingLocation() {
   console.log("pingLocation: Starting location ping sequence...");
   await logDiag("ping_start", "pingLocation invoked");
@@ -504,8 +406,19 @@ async function pingLocation() {
   await flushQueue();
 
   try {
-    const deviceId = await resolveDeviceId("pingLocation");
-    if (!deviceId) return; // nothing to attribute this ping to - don't publish under a placeholder/wrong device
+    // 1. Get the exact Google Workspace Device ID dynamically
+    let deviceId = "3421537a-01b4-4013-9654-de1c6a2cf3b9"; // Fallback for local testing
+    if (chrome.enterprise && chrome.enterprise.deviceAttributes) {
+      deviceId = await new Promise((resolve) => {
+        chrome.enterprise.deviceAttributes.getDirectoryDeviceId(resolve);
+      });
+      console.log(`pingLocation: Fetched real device ID: ${deviceId}`);
+      await logDiag("device_id_ok", deviceId);
+    } else {
+      console.warn("pingLocation: chrome.enterprise.deviceAttributes API not available. Using fallback device ID.");
+      await logDiag("device_id_fallback", `enterprise.deviceAttributes unavailable - using fallback ID ${deviceId}`);
+    }
+    await chrome.storage.local.set({ lastKnownDeviceId: deviceId });
 
     // 2. Setup offscreen document for geolocation (required in Manifest V3)
     await setupOffscreenDocument('offscreen.html');
@@ -573,147 +486,3 @@ async function setupOffscreenDocument(path) {
     justification: 'Required to get accurate device location for the IT admin portal'
   });
 }
-
-// --- Real-time online/offline via a persistent WebSocket -----------------
-// A genuinely different signal from pingLocation()'s periodic HTTP posts
-// above: instead of the portal inferring "online" from "reported something
-// within the last N minutes," the server knows within seconds of this
-// socket actually closing (network lost, device slept/powered off, or a
-// clean disconnect) - see handleDeviceWebSocket on the backend. This is
-// pure connectivity signaling, no location/geolocation involved, and
-// doesn't touch pingLocation's own flow at all - a fully separate
-// connection for a fully separate purpose.
-//
-// Local-testing only: USE_COLLECTOR_API=true means this build is talking
-// to the real Halofort collector API, which doesn't have this endpoint -
-// opening it there would just be a permanent, pointless reconnect loop.
-//
-// Known platform limitation, stated plainly rather than glossed over: MV3
-// service workers are NOT guaranteed to stay alive just because a
-// WebSocket is open (confirmed - this isn't one of the APIs Chrome's own
-// keepalive tracking covers, unlike a pending chrome.* call). If Chrome
-// terminates this worker while idle, the socket closes with it, and the
-// portal will correctly show this device as offline until something wakes
-// the worker again. The location-ping alarm (already firing on its own
-// configured interval, as low as 1 minute) doubles as the reconnect
-// safety net below, so a killed worker doesn't stay disconnected for
-// longer than that interval even in the worst case - genuinely "instant"
-// in the common case (worker alive, socket open), bounded by the ping
-// interval in the worst case (worker was killed and is waiting to be
-// woken again).
-let wsConn = null;
-let wsHeartbeatTimer = null;
-let wsReconnectTimer = null;
-let wsReconnectDelayMs = 2000;
-const WS_RECONNECT_MAX_DELAY_MS = 60000;
-// wsLastConfirmedAliveAt is round-trip proof, not just "the local socket
-// object's readyState still says OPEN" - confirmed live as a real gap: a
-// connection can die server-side (the backend's own read loop already
-// exited) while this extension's WebSocket handle still reports OPEN,
-// especially across an MV3 service-worker suspend/resume where the close
-// event never got a chance to fire before the worker was torn down. The
-// server now acks every heartbeat (see handleDeviceWebSocket) specifically
-// so this has something genuine to check staleness against, instead of
-// trusting a local flag that can go stale forever with nothing to correct
-// it. Set on open (a fresh connection is alive by definition) and on every
-// ack received after that.
-let wsLastConfirmedAliveAt = 0;
-const WS_STALE_MS = 90000; // 2x the server's ping/pong cadence + slack
-
-function wsUrlFromApiUrl(apiUrl) {
-  try {
-    const u = new URL(apiUrl);
-    u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-    u.pathname = "/api/chromeos/ws";
-    u.search = "";
-    return u.toString();
-  } catch (e) {
-    return null;
-  }
-}
-
-function wsIsOpen() {
-  return !!wsConn && wsConn.readyState === WebSocket.OPEN;
-}
-
-async function connectDeviceWebSocket() {
-  if (USE_COLLECTOR_API) return; // real production backend has no such endpoint - local testing only
-
-  if (wsIsOpen() || (wsConn && wsConn.readyState === WebSocket.CONNECTING)) {
-    const staleFor = Date.now() - wsLastConfirmedAliveAt;
-    if (staleFor < WS_STALE_MS) return; // genuinely fine, no action needed
-    // Stale: readyState still claims open/connecting, but no round-trip ack
-    // in over WS_STALE_MS - treat as dead and force a fresh connection
-    // rather than trusting a handle that may just never update on its own.
-    logDiag("ws_stale", `no ack in ${Math.round(staleFor / 1000)}s despite readyState=${wsConn.readyState} - forcing reconnect`);
-    try { wsConn.close(); } catch (e) { /* best-effort - we're discarding it either way */ }
-    wsConn = null;
-    clearInterval(wsHeartbeatTimer);
-  }
-
-  const deviceId = await resolveDeviceId("connectDeviceWebSocket");
-  if (!deviceId) return; // will retry next time the alarm fires - see below
-
-  const base = wsUrlFromApiUrl(API_URL);
-  if (!base) return;
-  const url = `${base}?deviceId=${encodeURIComponent(deviceId)}`;
-
-  try {
-    const socket = new WebSocket(url);
-    wsConn = socket;
-
-    socket.onopen = () => {
-      wsReconnectDelayMs = 2000; // reset backoff on a successful connect
-      wsLastConfirmedAliveAt = Date.now();
-      logDiag("ws_connected", `live connection open to ${base}`);
-      clearInterval(wsHeartbeatTimer);
-      // App-level heartbeat on top of the server's own ping/pong control
-      // frames - belt and suspenders, and gives the diagnostic log a
-      // periodic "still alive" entry to visually confirm against.
-      wsHeartbeatTimer = setInterval(() => {
-        if (wsIsOpen()) socket.send("hb");
-      }, 20000);
-    };
-
-    socket.onmessage = () => {
-      // Any message from the server (the "ack" reply to our own heartbeat,
-      // specifically) is round-trip proof this connection is genuinely
-      // still alive right now - see WS_STALE_MS above for why this matters
-      // more than the socket's own readyState.
-      wsLastConfirmedAliveAt = Date.now();
-    };
-
-    socket.onclose = (event) => {
-      clearInterval(wsHeartbeatTimer);
-      logDiag("ws_disconnected", `code ${event.code}${event.reason ? " - " + event.reason : ""}`);
-      scheduleWsReconnect();
-    };
-
-    socket.onerror = () => {
-      // onclose always follows onerror for a WebSocket - the actual
-      // reconnect scheduling happens there, this is just for the log.
-      logDiag("ws_error", "connection error");
-    };
-  } catch (e) {
-    logDiag("ws_error", `failed to open: ${e.message}`);
-    scheduleWsReconnect();
-  }
-}
-
-function scheduleWsReconnect() {
-  clearTimeout(wsReconnectTimer);
-  wsReconnectTimer = setTimeout(() => {
-    wsReconnectDelayMs = Math.min(wsReconnectDelayMs * 2, WS_RECONNECT_MAX_DELAY_MS);
-    connectDeviceWebSocket();
-  }, wsReconnectDelayMs);
-}
-
-chrome.runtime.onInstalled.addListener(() => { connectDeviceWebSocket(); });
-chrome.runtime.onStartup.addListener(() => { connectDeviceWebSocket(); });
-// Reconnect safety net: piggybacks on the existing location-ping alarm
-// (see the top of this file) instead of a second alarm, since Chrome
-// enforces a 1-minute floor on alarm periods regardless of packaging - this
-// runs at whatever interval that alarm is already configured for.
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "location-ping") connectDeviceWebSocket();
-});

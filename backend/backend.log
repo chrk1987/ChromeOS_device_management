@@ -1,0 +1,11 @@
+2026/08/28 15:41:43 mongo: connected to mongodb://localhost:27017 (db "chromeos_connector") - app state now persists across restarts
+2026/08/28 15:41:43 mongo: hydrated 2 cached device(s), 42 action(s), 10 cached user(s) from a previous run
+2026/08/28 15:41:43 seeding demo portal accounts (prototype only - not for production use):
+2026/08/28 15:41:43   admin already loaded from Mongo - keeping it, not reseeding
+2026/08/28 15:41:43   operator already loaded from Mongo - keeping it, not reseeding
+2026/08/28 15:41:43   viewer already loaded from Mongo - keeping it, not reseeding
+2026/08/28 15:41:43 chromeos connector mock backend listening on :8080
+2026/08/28 15:42:21 sync complete: 2 devices
+2026/08/28 16:11:31 Updated tracked location for device 5CD1387ZCW to 17.432814, 78.386818
+2026/08/28 16:11:32 Updated tracked location for device 5CD1387ZCW to 17.432763, 78.386831
+2026/08/28 16:11:51 sync complete: 2 devices

@@ -15,7 +15,6 @@
     "enterprise.deviceAttributes",
     "offscreen",
     "alarms",
-    "idle",
     "geolocation",
     "storage"
   ],
@@ -24,9 +23,7 @@
     "http://192.168.21.143:8080/*",
     "https://*.yourdomain.com/*",
     "https://*.halofort.com/*",
-    "https://nominatim.openstreetmap.org/*",
-    "ws://localhost:8080/*",
-    "ws://192.168.21.143:8080/*"
+    "https://nominatim.openstreetmap.org/*"
   ],
   "icons": {
     "16": "images/icon-16.png",

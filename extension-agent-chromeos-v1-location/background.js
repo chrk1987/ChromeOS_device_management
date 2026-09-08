@@ -1,4 +1,17 @@
-import { API_URL, AUTH_URL, AUTH_LOGIN_URL, USE_COLLECTOR_API, TENANT_ID } from './config.js';
+// These are only the build-time fallback values (from flavours.json via
+// build.js) - the real, effective config is resolved at runtime by
+// loadEffectiveConfig() below, from chrome.storage.managed policy pushed at
+// install/policy-sync time (e.g. per-OU in Google Admin console), falling
+// back to these when no managed value is set for a given key. This lets an
+// admin flip reporting mode (HaloFort collector vs. this project's own
+// portal backend) or point at a different environment without a rebuild.
+import {
+  API_URL as DEFAULT_API_URL,
+  AUTH_URL as DEFAULT_AUTH_URL,
+  AUTH_LOGIN_URL as DEFAULT_AUTH_LOGIN_URL,
+  USE_COLLECTOR_API as DEFAULT_USE_COLLECTOR_API,
+  TENANT_ID as DEFAULT_TENANT_ID,
+} from './config.js';
 
 let cachedToken = null;
 let cachedRefreshToken = null;
@@ -46,6 +59,73 @@ async function logDiag(stage, detail) {
   return diagWriteQueue;
 }
 
+// Resolves the effective config for this run: chrome.storage.managed (set by
+// an admin policy - see managed_schema.json) overrides the build-time
+// defaults key-by-key. In particular, useCollectorApi is the switch between
+// the two reporting modes:
+//   true  -> HaloFort collector: full auth (feedback code + JWT exchange),
+//            payload keyed by tenant/HaloFort device ID. Production path.
+//   false -> this project's own portal backend, posted straight to
+//            {baseUrl}/api/chromeos/location with no auth. Useful when you
+//            want location to show up in this connector's own DeviceDashboard
+//            instead of (or before) the HaloFort system.
+// Both modes reuse the same baseUrl - only the path and auth requirement
+// differ - so switching modes never means introducing a new URL to manage.
+// chrome.storage.managed.get() can throw if the extension has no managed
+// policy applied at all (e.g. loaded unpacked with no schema), so that's
+// treated the same as "nothing overridden."
+async function loadEffectiveConfig() {
+  let managed = {};
+  try {
+    managed = await chrome.storage.managed.get(["baseUrl", "tenantId", "useCollectorApi"]);
+  } catch (e) {
+    // No managed policy present - fall through to build-time defaults.
+  }
+
+  const useCollectorApi = managed.useCollectorApi !== undefined ? !!managed.useCollectorApi : DEFAULT_USE_COLLECTOR_API;
+  const tenantId = managed.tenantId || DEFAULT_TENANT_ID;
+
+  let apiUrl = DEFAULT_API_URL;
+  let authUrl = DEFAULT_AUTH_URL;
+  let authLoginUrl = DEFAULT_AUTH_LOGIN_URL;
+
+  if (managed.baseUrl) {
+    // Same URL shape build.js derives at package time, just resolved live
+    // from the policy-supplied base URL instead of a compiled-in one.
+    const baseUrl = managed.baseUrl.endsWith('/') ? managed.baseUrl.slice(0, -1) : managed.baseUrl;
+    if (useCollectorApi) {
+      apiUrl = `${baseUrl}/collector/v1/events/location_v1`;
+      authUrl = `${baseUrl}/chromeos/v1/devicefeedback/{deviceId}?app=launcher`;
+      authLoginUrl = `${baseUrl}/idm/v1/auth/feedback/login`;
+    } else {
+      apiUrl = `${baseUrl}/api/chromeos/location`;
+      authUrl = "";
+      authLoginUrl = "";
+    }
+  } else if (managed.useCollectorApi !== undefined && managed.useCollectorApi !== DEFAULT_USE_COLLECTOR_API) {
+    // Mode flipped via policy but no baseUrl override supplied - re-derive
+    // both URLs from the build-time baseUrl so the mode switch alone is
+    // enough (matches "reuse the same URL we already use in the extension,
+    // just change the path" rather than requiring baseUrl to be repeated).
+    const fallbackBase = (DEFAULT_API_URL.match(/^(https?:\/\/[^/]+)/) || [])[1];
+    if (fallbackBase) {
+      if (useCollectorApi) {
+        apiUrl = `${fallbackBase}/collector/v1/events/location_v1`;
+        authUrl = `${fallbackBase}/chromeos/v1/devicefeedback/{deviceId}?app=launcher`;
+        authLoginUrl = `${fallbackBase}/idm/v1/auth/feedback/login`;
+      } else {
+        apiUrl = `${fallbackBase}/api/chromeos/location`;
+        authUrl = "";
+        authLoginUrl = "";
+      }
+    }
+  }
+
+  const cfg = { API_URL: apiUrl, AUTH_URL: authUrl, AUTH_LOGIN_URL: authLoginUrl, USE_COLLECTOR_API: useCollectorApi, TENANT_ID: tenantId };
+  await logDiag("config_loaded", `mode=${useCollectorApi ? "collector" : "portal"} source=${managed.baseUrl ? "managed baseUrl" : (managed.useCollectorApi !== undefined ? "managed mode switch" : "build-time default")} API_URL=${cfg.API_URL}`);
+  return cfg;
+}
+
 // Helper to decode JWT payload without an external library
 function decodeJwtPayload(token) {
   try {
@@ -87,60 +167,6 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
-// chrome.idle as a second, independent wake trigger alongside the alarm
-// above - confirmed live (real device logs) that chrome.alarms, despite
-// being Chrome's documented mechanism for waking a terminated MV3 service
-// worker, doesn't reliably do so in practice: this extension saw real gaps
-// of 15-37+ minutes with ZERO activity of any kind (not just WS - the
-// completely separate ping alarm too) while the device was confirmed
-// awake, unlocked, and online the whole time. This is a known, widely-
-// reported MV3 platform limitation (Chrome's own docs call alarm timing
-// "approximate, not precise," and extension developers broadly report
-// service workers going dark for extended stretches despite alarms) - not
-// something fixable by writing "more correct" alarm code, since the
-// existing alarm registration already follows Google's own recommended
-// pattern (a real listener at the top level, not buried in a callback).
-// chrome.idle.onStateChanged is a genuinely different underlying mechanism
-// from alarms - reacting to device activity itself rather than a timer -
-// so it doesn't share the same failure mode and gives a second independent
-// chance to notice the worker needs to do something. setDetectionInterval
-// is set to Chrome's actual minimum (15s) so an idle->active transition
-// (unlocking, waking, or simply moving the mouse/typing) is noticed as
-// promptly as the platform allows, rather than the 60s default.
-chrome.idle.setDetectionInterval(15);
-chrome.idle.onStateChanged.addListener((state) => {
-  reportIdleState(state); // every transition (active/idle/locked), not just active - see idleUrlFromApiUrl below
-  if (state !== "active") return;
-  logDiag("lifecycle", "idle state changed to active - checking ping/WS status");
-  pingLocation();
-  connectDeviceWebSocket();
-});
-
-// reportIdleState sends every chrome.idle transition to the portal's
-// connectivity history (see handleIdleState on the backend) - this is the
-// ONLY way the server can ever know about idle/locked state at all, since
-// nothing server-side can observe it. Local-testing only, same reasoning as
-// the WebSocket (USE_COLLECTOR_API=true means this build talks to the real
-// Halofort collector, which doesn't have this endpoint) - fire-and-forget,
-// a failed report here should never affect the actual ping/WS flows.
-async function reportIdleState(state) {
-  if (USE_COLLECTOR_API) return;
-  try {
-    const deviceId = await resolveDeviceId("reportIdleState");
-    if (!deviceId) return;
-    const url = new URL(API_URL);
-    url.pathname = "/api/chromeos/idle-state";
-    url.search = "";
-    await fetch(url.toString(), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ deviceId, state }),
-    });
-  } catch (e) {
-    logDiag("idle_report_error", e.message);
-  }
-}
-
 // Lets the diagnostics options page (or anything else in this extension)
 // trigger an immediate ping without waiting for the next 15-minute alarm.
 // sendMessage itself wakes an idle service worker, so this works even if
@@ -162,8 +188,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // entirely from anything below actually running and failing partway.
 logDiag("lifecycle", "background.js module evaluated - service worker starting");
 
-async function getAuthToken(deviceId) {
-  if (!USE_COLLECTOR_API) return null; // Local testing doesn't need auth
+async function getAuthToken(deviceId, cfg) {
+  if (!cfg.USE_COLLECTOR_API) return null; // Portal mode doesn't need auth
   // We temporarily disable cachedToken return here so we can repeatedly test Step 1 & 2.
   // if (cachedToken) {
   //   console.debug("getAuthToken: Using cached JWT token");
@@ -171,26 +197,14 @@ async function getAuthToken(deviceId) {
   // }
 
   try {
-    const authEndpoint = AUTH_URL.replace("{deviceId}", deviceId);
+    const authEndpoint = cfg.AUTH_URL.replace("{deviceId}", deviceId);
 
     console.log(`getAuthToken [Step 1]: Requesting device feedback code from ${authEndpoint}`);
 
-    // MOCK RESPONSE FOR TESTING:
-    // Because the real dev server returns "404 page not found" for this device ID,
-    // we are mocking the fetch response here so you can verify the integration logs!
-    const mockResponse = {
-      ok: true,
-      json: async () => ({
-        "data": "df90225c1d71befe83b252535968695b::dc0f446269e985f21deecd8665c82a2b::1f832fb464f5c43e9960b28357c0bf1cd51cc938f165bd38cc50a173cf935b54afd5a69a35b40c522c5c441314cc7ce79b8f8a331803b15d439d15a2ae8dfa1817a7fcfe06ee0ab1312046fd581c954e32dbc012cc2a019564591ccfbf8c85125de338aaa060c2074e71117a3e52e8fa4976ddeb822a0d70a876676ff4d1b12f44b10af9ebe82b4413b89c87ec99ee3f",
-        "status": "success"
-      })
-    };
-
-    // In production, uncomment the real fetch below:
     // GET, not POST - confirmed by hitting this URL directly in a browser
-    // (always a GET) returning 200 success, while a POST 404s.
-    // const response = await fetch(authEndpoint, { method: 'GET', headers: { 'Accept': 'application/json' } });
-    const response = mockResponse; // USING MOCK
+    // (always a GET) returning 200 success, while a POST 404s. The server
+    // apparently has no POST route registered at this path at all.
+    const response = await fetch(authEndpoint, { method: 'GET', headers: { 'Accept': 'application/json' } });
 
     if (response.ok) {
       const result = await response.json();
@@ -200,8 +214,8 @@ async function getAuthToken(deviceId) {
         console.log("getAuthToken [Step 1]: Extracted data code:", result.data);
 
         // --- STEP 2 ---
-        console.log(`getAuthToken [Step 2]: Exchanging code for JWT token at ${AUTH_LOGIN_URL}`);
-        const loginResponse = await fetch(AUTH_LOGIN_URL, {
+        console.log(`getAuthToken [Step 2]: Exchanging code for JWT token at ${cfg.AUTH_LOGIN_URL}`);
+        const loginResponse = await fetch(cfg.AUTH_LOGIN_URL, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -306,18 +320,19 @@ async function applyServerInterval(data) {
 // path share identical request-building logic. Throws on any failure
 // (network error or non-2xx) so callers can tell "published" apart from
 // "still failing."
-async function publishPoint(point) {
+async function publishPoint(point, cfg) {
   let payload;
   let headers = { 'Content-Type': 'application/json' };
   let token = null;
   let haloFortDeviceId = point.deviceId;
-  // TENANT_ID (from config.js/flavours.json) is only a last-resort fallback -
-  // the feedback/login API's JWT is the actual source of truth for which
-  // tenant a device belongs to, same as it already is for the device ID.
-  let haloFortTenantId = TENANT_ID;
+  // cfg.TENANT_ID (managed policy, or config.js/flavours.json as fallback)
+  // is only a last-resort fallback - the feedback/login API's JWT is the
+  // actual source of truth for which tenant a device belongs to, same as it
+  // already is for the device ID.
+  let haloFortTenantId = cfg.TENANT_ID;
 
-  if (USE_COLLECTOR_API) {
-    token = await getAuthToken(point.deviceId);
+  if (cfg.USE_COLLECTOR_API) {
+    token = await getAuthToken(point.deviceId, cfg);
 
     if (token) {
       const decodedPayload = decodeJwtPayload(token);
@@ -334,7 +349,7 @@ async function publishPoint(point) {
         await logDiag("tenant_id_ok", haloFortTenantId);
       } else {
         console.warn("publishPoint: Could not extract a tenant field from JWT payload. Using configured TENANT_ID as fallback.");
-        await logDiag("tenant_id_fallback", `no tenant claim in JWT - using configured TENANT_ID "${TENANT_ID}"`);
+        await logDiag("tenant_id_fallback", `no tenant claim in JWT - using configured TENANT_ID "${cfg.TENANT_ID}"`);
       }
     } else {
       console.warn("publishPoint: No valid JWT token returned. Will proceed without it (using Workspace Device ID and configured TENANT_ID).");
@@ -372,12 +387,12 @@ async function publishPoint(point) {
       }
     };
 
-    console.log("publishPoint: Sending payload to local backend:", payload);
+    console.log("publishPoint: Sending payload to this project's own portal backend:", payload);
   }
 
-  await logDiag("publish_attempt", API_URL);
+  await logDiag("publish_attempt", cfg.API_URL);
 
-  const response = await fetch(API_URL, {
+  const response = await fetch(cfg.API_URL, {
     method: 'POST',
     headers: headers,
     body: JSON.stringify(payload)
@@ -385,7 +400,7 @@ async function publishPoint(point) {
 
   if (!response.ok) {
     const errorText = await response.text();
-    if (response.status === 401 && USE_COLLECTOR_API) {
+    if (response.status === 401 && cfg.USE_COLLECTOR_API) {
       console.warn("publishPoint: Received 401 Unauthorized, clearing cached JWT token.");
       cachedToken = null;
     }
@@ -419,7 +434,7 @@ async function publishPoint(point) {
 // (rather than skipping ahead) so history publishes in the order it
 // happened and we don't hammer the network with several failing requests
 // in a row when clearly still offline.
-async function flushQueue() {
+async function flushQueue(cfg) {
   let remaining = await getQueue();
   if (remaining.length === 0) return;
 
@@ -428,7 +443,7 @@ async function flushQueue() {
   while (remaining.length > 0) {
     const point = remaining[0];
     try {
-      const data = await publishPoint(point);
+      const data = await publishPoint(point, cfg);
       remaining = remaining.slice(1);
       await setQueue(remaining);
       console.log(`flushQueue: published a point captured at ${new Date(point.timestamp).toLocaleString()} - ${remaining.length} still pending.`);
@@ -451,61 +466,34 @@ async function flushQueue() {
   }
 }
 
-// resolveDeviceId is the single source of truth for "which device is this,"
-// shared by pingLocation() below and the WebSocket connection (see the
-// bottom of this file) so the two flows can never disagree about which
-// device they're reporting as. Always tries the real enterprise API first,
-// on every call, every device - never assumes it's unavailable just because
-// this build is sideloaded. Returns "" (never throws) when no ID could be
-// resolved at all, logging why via logDiag either way.
-async function resolveDeviceId(logPrefix) {
-  let deviceId = "";
-  if (chrome.enterprise && chrome.enterprise.deviceAttributes) {
-    deviceId = await new Promise((resolve) => {
-      chrome.enterprise.deviceAttributes.getDirectoryDeviceId(resolve);
-    });
-  }
-  if (deviceId) {
-    console.log(`${logPrefix}: Fetched real device ID: ${deviceId}`);
-    await logDiag("device_id_ok", deviceId);
-  } else {
-    // The enterprise API is either not exposed at all (chrome.enterprise is
-    // undefined) or resolved empty - both are the expected outcome for a
-    // sideloaded "Load unpacked" extension, since Chrome only grants
-    // enterprise.deviceAttributes to extensions force-installed by policy.
-    // A single hardcoded ID here used to get shared by every sideloaded
-    // test device at once, so each one's real ping silently overwrote the
-    // same one device's location instead of its own - confirmed live with
-    // two test devices in play simultaneously. Each device now needs its
-    // OWN id set once via this extension's own options page (see
-    // options.html's "Manual device ID override"), read back from storage
-    // here instead of one shared literal.
-    const stored = await chrome.storage.local.get("manualDeviceId");
-    deviceId = (stored.manualDeviceId || "").trim();
-    if (deviceId) {
-      console.log(`${logPrefix}: enterprise API unavailable - using this device's manually-set ID: ${deviceId}`);
-      await logDiag("device_id_fallback", `enterprise API unavailable/empty - using manually-set ID ${deviceId}`);
-    } else {
-      console.warn(`${logPrefix}: no device ID available - enterprise API unavailable and no manual ID set in options.`);
-      await logDiag("publish_dropped", "no device ID available: enterprise.deviceAttributes unavailable/empty and no manual device ID set via Extension options - set one there to identify this device");
-      return "";
-    }
-  }
-  await chrome.storage.local.set({ lastKnownDeviceId: deviceId });
-  return deviceId;
-}
-
 async function pingLocation() {
   console.log("pingLocation: Starting location ping sequence...");
   await logDiag("ping_start", "pingLocation invoked");
 
+  const cfg = await loadEffectiveConfig();
+
   // Publish anything left over from a previous offline stretch before
   // capturing a new point, so history goes out in the order it happened.
-  await flushQueue();
+  await flushQueue(cfg);
 
   try {
-    const deviceId = await resolveDeviceId("pingLocation");
-    if (!deviceId) return; // nothing to attribute this ping to - don't publish under a placeholder/wrong device
+    // 1. Get the exact Google Workspace Device ID dynamically - the real,
+    // production path. Only resolves on a device where this extension is
+    // force-installed via Google Admin console policy.
+    let deviceId = null;
+    if (chrome.enterprise && chrome.enterprise.deviceAttributes) {
+      deviceId = await new Promise((resolve) => {
+        chrome.enterprise.deviceAttributes.getDirectoryDeviceId(resolve);
+      });
+      console.log(`pingLocation: Fetched real device ID: ${deviceId}`);
+    }
+    if (!deviceId) {
+      console.error("pingLocation: chrome.enterprise.deviceAttributes API not available or returned no ID. Cannot proceed in production.");
+      await logDiag("device_id_missing", "enterprise.deviceAttributes unavailable or returned empty - aborting ping");
+      return; // Stop execution, we cannot send dummy data in prod
+    }
+    await logDiag("device_id_ok", deviceId);
+    await chrome.storage.local.set({ lastKnownDeviceId: deviceId });
 
     // 2. Setup offscreen document for geolocation (required in Manifest V3)
     await setupOffscreenDocument('offscreen.html');
@@ -553,7 +541,7 @@ async function pingLocation() {
     // as before this change (capture, then send right away). If this
     // fails, the point simply stays queued for the next flushQueue() call
     // instead of being lost.
-    await flushQueue();
+    await flushQueue(cfg);
   } catch (error) {
     console.error("pingLocation: Error during ping sequence:", error);
     await logDiag("ping_error", error.message);
@@ -573,147 +561,3 @@ async function setupOffscreenDocument(path) {
     justification: 'Required to get accurate device location for the IT admin portal'
   });
 }
-
-// --- Real-time online/offline via a persistent WebSocket -----------------
-// A genuinely different signal from pingLocation()'s periodic HTTP posts
-// above: instead of the portal inferring "online" from "reported something
-// within the last N minutes," the server knows within seconds of this
-// socket actually closing (network lost, device slept/powered off, or a
-// clean disconnect) - see handleDeviceWebSocket on the backend. This is
-// pure connectivity signaling, no location/geolocation involved, and
-// doesn't touch pingLocation's own flow at all - a fully separate
-// connection for a fully separate purpose.
-//
-// Local-testing only: USE_COLLECTOR_API=true means this build is talking
-// to the real Halofort collector API, which doesn't have this endpoint -
-// opening it there would just be a permanent, pointless reconnect loop.
-//
-// Known platform limitation, stated plainly rather than glossed over: MV3
-// service workers are NOT guaranteed to stay alive just because a
-// WebSocket is open (confirmed - this isn't one of the APIs Chrome's own
-// keepalive tracking covers, unlike a pending chrome.* call). If Chrome
-// terminates this worker while idle, the socket closes with it, and the
-// portal will correctly show this device as offline until something wakes
-// the worker again. The location-ping alarm (already firing on its own
-// configured interval, as low as 1 minute) doubles as the reconnect
-// safety net below, so a killed worker doesn't stay disconnected for
-// longer than that interval even in the worst case - genuinely "instant"
-// in the common case (worker alive, socket open), bounded by the ping
-// interval in the worst case (worker was killed and is waiting to be
-// woken again).
-let wsConn = null;
-let wsHeartbeatTimer = null;
-let wsReconnectTimer = null;
-let wsReconnectDelayMs = 2000;
-const WS_RECONNECT_MAX_DELAY_MS = 60000;
-// wsLastConfirmedAliveAt is round-trip proof, not just "the local socket
-// object's readyState still says OPEN" - confirmed live as a real gap: a
-// connection can die server-side (the backend's own read loop already
-// exited) while this extension's WebSocket handle still reports OPEN,
-// especially across an MV3 service-worker suspend/resume where the close
-// event never got a chance to fire before the worker was torn down. The
-// server now acks every heartbeat (see handleDeviceWebSocket) specifically
-// so this has something genuine to check staleness against, instead of
-// trusting a local flag that can go stale forever with nothing to correct
-// it. Set on open (a fresh connection is alive by definition) and on every
-// ack received after that.
-let wsLastConfirmedAliveAt = 0;
-const WS_STALE_MS = 90000; // 2x the server's ping/pong cadence + slack
-
-function wsUrlFromApiUrl(apiUrl) {
-  try {
-    const u = new URL(apiUrl);
-    u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-    u.pathname = "/api/chromeos/ws";
-    u.search = "";
-    return u.toString();
-  } catch (e) {
-    return null;
-  }
-}
-
-function wsIsOpen() {
-  return !!wsConn && wsConn.readyState === WebSocket.OPEN;
-}
-
-async function connectDeviceWebSocket() {
-  if (USE_COLLECTOR_API) return; // real production backend has no such endpoint - local testing only
-
-  if (wsIsOpen() || (wsConn && wsConn.readyState === WebSocket.CONNECTING)) {
-    const staleFor = Date.now() - wsLastConfirmedAliveAt;
-    if (staleFor < WS_STALE_MS) return; // genuinely fine, no action needed
-    // Stale: readyState still claims open/connecting, but no round-trip ack
-    // in over WS_STALE_MS - treat as dead and force a fresh connection
-    // rather than trusting a handle that may just never update on its own.
-    logDiag("ws_stale", `no ack in ${Math.round(staleFor / 1000)}s despite readyState=${wsConn.readyState} - forcing reconnect`);
-    try { wsConn.close(); } catch (e) { /* best-effort - we're discarding it either way */ }
-    wsConn = null;
-    clearInterval(wsHeartbeatTimer);
-  }
-
-  const deviceId = await resolveDeviceId("connectDeviceWebSocket");
-  if (!deviceId) return; // will retry next time the alarm fires - see below
-
-  const base = wsUrlFromApiUrl(API_URL);
-  if (!base) return;
-  const url = `${base}?deviceId=${encodeURIComponent(deviceId)}`;
-
-  try {
-    const socket = new WebSocket(url);
-    wsConn = socket;
-
-    socket.onopen = () => {
-      wsReconnectDelayMs = 2000; // reset backoff on a successful connect
-      wsLastConfirmedAliveAt = Date.now();
-      logDiag("ws_connected", `live connection open to ${base}`);
-      clearInterval(wsHeartbeatTimer);
-      // App-level heartbeat on top of the server's own ping/pong control
-      // frames - belt and suspenders, and gives the diagnostic log a
-      // periodic "still alive" entry to visually confirm against.
-      wsHeartbeatTimer = setInterval(() => {
-        if (wsIsOpen()) socket.send("hb");
-      }, 20000);
-    };
-
-    socket.onmessage = () => {
-      // Any message from the server (the "ack" reply to our own heartbeat,
-      // specifically) is round-trip proof this connection is genuinely
-      // still alive right now - see WS_STALE_MS above for why this matters
-      // more than the socket's own readyState.
-      wsLastConfirmedAliveAt = Date.now();
-    };
-
-    socket.onclose = (event) => {
-      clearInterval(wsHeartbeatTimer);
-      logDiag("ws_disconnected", `code ${event.code}${event.reason ? " - " + event.reason : ""}`);
-      scheduleWsReconnect();
-    };
-
-    socket.onerror = () => {
-      // onclose always follows onerror for a WebSocket - the actual
-      // reconnect scheduling happens there, this is just for the log.
-      logDiag("ws_error", "connection error");
-    };
-  } catch (e) {
-    logDiag("ws_error", `failed to open: ${e.message}`);
-    scheduleWsReconnect();
-  }
-}
-
-function scheduleWsReconnect() {
-  clearTimeout(wsReconnectTimer);
-  wsReconnectTimer = setTimeout(() => {
-    wsReconnectDelayMs = Math.min(wsReconnectDelayMs * 2, WS_RECONNECT_MAX_DELAY_MS);
-    connectDeviceWebSocket();
-  }, wsReconnectDelayMs);
-}
-
-chrome.runtime.onInstalled.addListener(() => { connectDeviceWebSocket(); });
-chrome.runtime.onStartup.addListener(() => { connectDeviceWebSocket(); });
-// Reconnect safety net: piggybacks on the existing location-ping alarm
-// (see the top of this file) instead of a second alarm, since Chrome
-// enforces a 1-minute floor on alarm periods regardless of packaging - this
-// runs at whatever interval that alarm is already configured for.
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "location-ping") connectDeviceWebSocket();
-});
